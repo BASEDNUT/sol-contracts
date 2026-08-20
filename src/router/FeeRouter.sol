@@ -16,7 +16,7 @@ import {IEAS, AttestationRequest, AttestationData} from "../interfaces/EAS.sol";
 /**
  * @title FeeRouter — NUT Credit Protocol fee deployment engine
  * @notice Splits incoming USDC:
- *         80% -> PIPS mint leg (via IPipsBuyer adapter; ACF auction calldata pending verification)
+ *         80% -> PIPS mint leg (via IPipsBuyer adapter)
  *         20% -> NUT LP leg  (USDC->NUT swap, wrap half -> wNUT, add wNUT/NUT liquidity)
  *         Every action emits an EAS attestation (Base predeploy 0x4200...0021).
  *         Immutable. Operator-gated. Pausable.

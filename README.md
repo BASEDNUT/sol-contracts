@@ -1,39 +1,32 @@
-# BASEDNUT sol-contracts
+# sol-contracts
 
-Solidity contracts for the NUT Credit Protocol on Base.
+Smart contracts for BASED NUT protocol infrastructure on Base.
 
-## Architecture
+## Contracts
 
-USDC revenue in → 80% PIPS mint leg / 20% NUT LP leg, attested on EAS.
+| Contract | Directory | Description |
+|---|---|---|
+| WNUT | `src/wnut/` | 1:1 ERC-20 wrapper over NUT |
+| FeeRouter | `src/router/` | Revenue deployment router with EAS attestations |
 
-```
-src/
-├── wnut/WNUT.sol        # 1:1 ERC-20 wrapper over NUT (OZ ERC20Wrapper, 18dp)
-├── router/FeeRouter.sol # 80/20 USDC splitter: PIPS mint + NUT/wNUT LP + EAS attestations
-├── interfaces/
-│   ├── EAS.sol          # Minimal EAS Core + Schema Registry (Base predeploys 0x4200...0020/21)
-│   ├── IPipsBuyer.sol   # PIPS adapter seam (ACF calldata pending verification)
-│   └── ISwapRouter.sol  # Generic V2-style swap + LP router seams
-test/
-├── wnut/WNUT.t.sol     # 9 tests
-├── router/FeeRouter.t.sol # 8 tests
-└── mocks/Mocks.sol      # Mock ERC20s, routers, EAS
-```
-## Status
+See each directory's README for contract details.
 
-| Component | State |
-|---|---|
-| WNUT wrapper | Written, 9/9 tests pass |
-| FeeRouter 80/20 | Written, 8/8 tests pass (mocks) |
-| EAS schemas | Not yet registered |
-| PIPS buyer adapter | PENDING — see research note |
-| Deployment | Not deployed |
+## Interfaces
 
-## Critical research finding (2026-08-19)
+| Interface | File | Purpose |
+|---|---|---|
+| EAS | `src/interfaces/EAS.sol` | Minimal EAS Core + Schema Registry |
+| IPipsBuyer | `src/interfaces/IPipsBuyer.sol` | PIPS purchase adapter |
+| ISwapRouter | `src/interfaces/ISwapRouter.sol` | Swap + liquidity router |
 
-PIPS (0x3f2327221dd4f0bae660172606d6b288a1cf8ad9) is **NOT on the classic Virtuals Fun bonding curve**. Token has no buy()/sell(). Curve/auction logic lives in Factory 0x488Db0978b34C6Fd901760b9024B565C1117c7c8 (impl UNVERIFIED on Basescan). ABI errors indicate ACF (Agent Capital Formation) auction model. Graduation → Uniswap V2 (not Aerodrome). Full research: `peanutoshi/research/virtuals-acp-pips-curve-2026-08-19.md`.
+## Dependencies
 
-FeeRouter is built against the `IPipsBuyer` adapter seam — swap the adapter implementation when exact ACF entry points are verified. Router surface stays stable.
+- [Foundry](https://getfoundry.sh) — build, test, local chain
+- [OpenZeppelin Contracts](https://github.com/OpenZeppelin/openzeppelin-contracts) 5.x
+- [forge-std](https://github.com/foundry-rs/forge-std) — test utilities
+- [EAS contracts](https://github.com/ethereum-attestation-service/eas-contracts) — reference
+
+Installed as git submodules in `lib/`.
 
 ## Build
 
@@ -42,7 +35,6 @@ forge build
 forge test
 ```
 
-## Dependencies
-- Foundry 1.7.1 (forge/cast/anvil) OpenZeppelin Contracts 5.x
-- EAS contracts (reference)
-- forge-std
+## License
+
+MIT
