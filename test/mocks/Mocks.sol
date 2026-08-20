@@ -23,11 +23,24 @@ contract MockPipsBuyer {
     }
 }
 
+/// @dev Lying adapter: claims max output, delivers 1 PIPS. Catches H-02 (return-value trust).
+contract LyingPipsBuyer {
+    MockERC20 public usdc;
+    MockERC20 public pips;
+    constructor(address usdc_, address pips_) { usdc = MockERC20(usdc_); pips = MockERC20(pips_); }
+    function buyPips(uint256 usdcAmount) external returns (uint256) {
+        usdc.transferFrom(msg.sender, address(this), usdcAmount);
+        pips.mint(msg.sender, 1); // deliver dust, claim huge
+        return type(uint256).max;
+    }
+}
+
 contract MockSwapRouter {
     MockERC20 public usdc;
     MockERC20 public nut;
     uint256 public rate = 3; // 1 USDC -> 3 NUT
     constructor(address usdc_, address nut_) { usdc = MockERC20(usdc_); nut = MockERC20(nut_); }
+    function setRate(uint256 r) external { rate = r; }
     function swapExactTokensForTokens(
         uint256 amountIn, uint256, address[] calldata, address to, uint256
     ) external returns (uint256[] memory amounts) {
@@ -58,5 +71,16 @@ contract MockEAS {
         attestCount++;
         uid = keccak256(abi.encodePacked(attestCount, request.schema, request.data.recipient));
         exists[uid] = true;
+    }
+}
+
+contract MockSchemaRegistry {
+    mapping(bytes32 => bool) public known;
+    function register(bytes32 uid) external { known[uid] = true; }
+    function getSchema(bytes32 uid)
+        external view returns (bytes32, address, bool, string memory, address, uint64)
+    {
+        require(known[uid], "unknown schema");
+        return (uid, address(0), false, "", address(this), 1);
     }
 }
