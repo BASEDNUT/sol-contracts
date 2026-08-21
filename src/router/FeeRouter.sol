@@ -11,7 +11,7 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import {IEAS} from "@eas/contracts/IEAS.sol";
 import {ISchemaRegistry, SchemaRecord} from "@eas/contracts/ISchemaRegistry.sol";
-import {AttestationRequest, AttestationRequestData} from "@eas/contracts/IEAS.sol";
+import {AttestationRequest, AttestationRequestData, MultiAttestationRequest} from "@eas/contracts/IEAS.sol";
 
 import {WNUT} from "../wnut/WNUT.sol";
 import {IPipsBuyer} from "../interfaces/IPipsBuyer.sol";
@@ -20,6 +20,12 @@ import {ISwapRouter, IAddLiquidityRouter} from "../interfaces/ISwapRouter.sol";
 interface IERC20Pair {
     function token0() external view returns (address);
     function token1() external view returns (address);
+}
+
+/// @dev Canonical Aerodrome Pool fee claim: pays pending swap fees to the
+///      calling LP holder. The router holds the LP, so the router claims.
+interface IPoolClaimFees {
+    function claimFees() external returns (uint256 claimed0, uint256 claimed1);
 }
 
 /**
@@ -75,10 +81,18 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
     uint256 public constant WINDOW_DURATION = 1 days;
 
     // ── Rolling window accounting (M-02) ──
-    uint256 private _windowStart;
-    uint256 private _windowUsdcProcessed;
-    bytes32 public pipsSchemaUID;
-    bytes32 public lpSchemaUID;
+    bytes32 public immutable pipsSchemaUID;
+    bytes32 public immutable lpSchemaUID;
+
+    // ── True rolling 24h window accounting ──
+    // Every processed run appends (timestamp, usdcConsumed). Entries older than
+    // WINDOW_DURATION are pruned; the sum of survivors bounds throughput.
+    // Invariant: USDC consumed in ANY 24h interval <= maxUsdcPerWindow.
+    struct SpendCheckpoint {
+        uint256 timestamp;
+        uint256 amount;
+    }
+    SpendCheckpoint[] private _spendCheckpoints;
 
     // ── Accounting (balance-delta measured) ──
     uint256 public totalUsdcProcessed;
@@ -103,11 +117,11 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
     event ResidualsCarried(uint256 usdc, uint256 wnut, uint256 nut);
     event ResidualsDeployed(uint256 wnut, uint256 nut, uint256 liquidity, uint256 timestamp);
     event PipsBpsUpdated(uint256 oldBps, uint256 newBps);
-    event SchemaUIDsUpdated(bytes32 pipsSchema, bytes32 lpSchema);
     event CapsUpdated(uint256 maxUsdcPerRun, uint256 maxDeadlineHorizon, uint256 maxUsdcPerWindow);
     event PipsRecovered(address indexed to, uint256 amount);
     event DustRecovered(address indexed token, address indexed to, uint256 amount);
     event UsdcRescued(address indexed to, uint256 amount);
+    event LpFeesClaimed(uint256 wnutDelta, uint256 nutDelta, uint256 timestamp);
 
     // ── Errors ──
     error ZeroAmount();
@@ -133,6 +147,7 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
     error AdminRenunciationForbidden();
     error ZeroRecipient();
     error NothingToDeploy();
+    error NothingToClaim();
 
     constructor(
         address usdc_,
@@ -198,7 +213,6 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         maxUsdcPerRun = maxUsdcPerRun_;
         maxDeadlineHorizon = maxDeadlineHorizon_;
         maxUsdcPerWindow = maxUsdcPerWindow_;
-        _windowStart = block.timestamp;
         pipsSchemaUID = pipsSchemaUID_;
         lpSchemaUID = lpSchemaUID_;
 
@@ -230,23 +244,29 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
     ) external nonReentrant whenNotPaused onlyRole(OPERATOR_ROLE) returns (bytes32 pipsUID, bytes32 lpUID) {
         if (usdcAmount == 0) revert ZeroAmount();
         if (usdcAmount > maxUsdcPerRun) revert AmountTooLarge();
-
-        // ── M-02: rolling 24h aggregate cap on operator throughput ──
-        if (block.timestamp >= _windowStart + WINDOW_DURATION) {
-            _windowStart = block.timestamp;
-            _windowUsdcProcessed = 0;
-        }
-        if (_windowUsdcProcessed + usdcAmount > maxUsdcPerWindow) revert WindowCapExceeded();
         if (minPipsOut == 0 || minNutOut == 0 || minLpWnut == 0 || minLpNut == 0 || minLiquidityOut == 0) {
             revert ZeroSlippageBound();
         }
         if (block.timestamp > deadline) revert DeadlineExpired();
         if (deadline - block.timestamp > maxDeadlineHorizon) revert DeadlineTooFar();
 
+        // ── Decision 1B: fold prior-run USDC carry into this deployment.
+        //    Under-spend (pipsBps = allocation CEILING, not mandatory spend) and
+        //    swap shortfalls roll forward instead of stranding until rescue.
+        //    Operator sizes usdcAmount so that carry + usdcAmount <= per-run cap.
+        uint256 carry = usdc.balanceOf(address(this));
+        uint256 effective = usdcAmount + carry;
+        if (effective > maxUsdcPerRun) revert AmountTooLarge();
+
+        // ── True rolling 24h cap: pre-check worst case (effective), record
+        //    actuals post-exec. Consumed in ANY 24h interval <= maxUsdcPerWindow.
+        uint256 rollingSpend = _pruneAndSumWindow();
+        if (rollingSpend + effective > maxUsdcPerWindow) revert WindowCapExceeded();
+
         usdc.safeTransferFrom(msg.sender, address(this), usdcAmount);
 
-        uint256 toPips = (usdcAmount * pipsBps) / 10_000;
-        uint256 toLp = usdcAmount - toPips;
+        uint256 toPips = (effective * pipsBps) / 10_000;
+        uint256 toLp = effective - toPips;
         if (toPips == 0 || toLp == 0) revert BadSplit();
 
         // ── Leg 1: PIPS mint (80%) — balance-delta verified ──
@@ -292,8 +312,9 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         if (liquidity < minLiquidityOut) revert InsufficientLiquidity();
 
         // ── Accounting: actuals only, before external attest calls ──
-        totalUsdcProcessed += usdcAmount;
-        _windowUsdcProcessed += usdcAmount;
+        uint256 usdcConsumed = usdcSpentOnPips + usdcSpentOnSwap;
+        totalUsdcProcessed += usdcConsumed;
+        _spendCheckpoints.push(SpendCheckpoint(block.timestamp, usdcConsumed));
         totalUsdcToPips += usdcSpentOnPips;
         totalUsdcToLp += usdcSpentOnSwap;
         totalPipsMinted += pipsMinted;
@@ -305,8 +326,16 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         );
 
         // ── Attestations ──
-        pipsUID = _attestPips(msg.sender, usdcAmount, usdcSpentOnPips, pipsMinted);
-        lpUID = _attestLp(msg.sender, usdcAmount, usdcSpentOnSwap, nutBought, liquidity);
+        AttestationRequestData[] memory pipsData = new AttestationRequestData[](1);
+        pipsData[0] = _buildPipsRequest(msg.sender, effective, usdcSpentOnPips, pipsMinted);
+        AttestationRequestData[] memory lpData = new AttestationRequestData[](1);
+        lpData[0] = _buildLpRequest(msg.sender, effective, usdcSpentOnSwap, nutBought, liquidity);
+        MultiAttestationRequest[] memory reqs = new MultiAttestationRequest[](2);
+        reqs[0] = MultiAttestationRequest({schema: pipsSchemaUID, data: pipsData});
+        reqs[1] = MultiAttestationRequest({schema: lpSchemaUID, data: lpData});
+        bytes32[] memory uids = eas.multiAttest(reqs);
+        pipsUID = uids[0];
+        lpUID = uids[1];
 
         emit FeesSplitAndDeployed(
             msg.sender,
@@ -327,6 +356,45 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
     /// @notice Current residual core-asset balances held by the router.
     function residuals() external view returns (uint256 usdcBal, uint256 wnutBal, uint256 nutBal) {
         return (usdc.balanceOf(address(this)), wnut.balanceOf(address(this)), nut.balanceOf(address(this)));
+    }
+
+    /// @notice Rolling USDC consumed in the last 24h (view-side sum, no prune).
+    function windowSpendLast24h() external view returns (uint256 sum) {
+        uint256 cutoff = block.timestamp > WINDOW_DURATION ? block.timestamp - WINDOW_DURATION : 0;
+        uint256 n = _spendCheckpoints.length;
+        for (uint256 i; i < n; ++i) {
+            if (_spendCheckpoints[i].timestamp > cutoff) sum += _spendCheckpoints[i].amount;
+        }
+    }
+
+    /// @notice Claim pending Aerodrome swap fees accrued to the protocol-owned
+    ///         LP position. Permissionless (keeper-callable, works while paused):
+    ///         fees are paid to the LP holder (this router) and land as NUT/wNUT
+    ///         residuals, deployable via deployResiduals(). LP tokens stay locked.
+    ///         Emitted amounts are balance-delta measured, never trusted returns.
+    function claimLpFees() external nonReentrant returns (uint256 wnutDelta, uint256 nutDelta) {
+        uint256 wnutBefore = wnut.balanceOf(address(this));
+        uint256 nutBefore = nut.balanceOf(address(this));
+        IPoolClaimFees(address(lpToken)).claimFees();
+        wnutDelta = wnut.balanceOf(address(this)) - wnutBefore;
+        nutDelta = nut.balanceOf(address(this)) - nutBefore;
+        if (wnutDelta + nutDelta == 0) revert NothingToClaim();
+        emit LpFeesClaimed(wnutDelta, nutDelta, block.timestamp);
+    }
+
+    /// @dev Prune entries older than WINDOW_DURATION and return the rolling sum.
+    function _pruneAndSumWindow() private returns (uint256 sum) {
+        uint256 cutoff = block.timestamp > WINDOW_DURATION ? block.timestamp - WINDOW_DURATION : 0;
+        uint256 n = _spendCheckpoints.length;
+        uint256 writeIdx;
+        for (uint256 i; i < n; ++i) {
+            if (_spendCheckpoints[i].timestamp > cutoff) {
+                sum += _spendCheckpoints[i].amount;
+                _spendCheckpoints[writeIdx] = _spendCheckpoints[i];
+                ++writeIdx;
+            }
+        }
+        while (_spendCheckpoints.length > writeIdx) _spendCheckpoints.pop();
     }
 
     /**
@@ -389,34 +457,26 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
             && address(record.resolver) == address(0) && !record.revocable;
     }
 
-    function _attestPips(address caller, uint256 usdcTotal, uint256 usdcToPips, uint256 pipsMinted)
+    function _buildPipsRequest(address caller, uint256 usdcTotal, uint256 usdcToPips, uint256 pipsMinted)
         internal
-        returns (bytes32)
+        view
+        returns (AttestationRequestData memory)
     {
         bytes memory data = abi.encode("PIPS_MINT", caller, usdcTotal, usdcToPips, pipsMinted, block.timestamp);
-        return eas.attest(
-            AttestationRequest({
-                schema: pipsSchemaUID,
-                data: AttestationRequestData({
-                    recipient: caller, expirationTime: 0, revocable: false, refUID: bytes32(0), data: data, value: 0
-                })
-            })
-        );
+        return AttestationRequestData({
+            recipient: caller, expirationTime: 0, revocable: false, refUID: bytes32(0), data: data, value: 0
+        });
     }
 
-    function _attestLp(address caller, uint256 usdcTotal, uint256 usdcToLp, uint256 nutBought, uint256 liquidity)
+    function _buildLpRequest(address caller, uint256 usdcTotal, uint256 usdcToLp, uint256 nutBought, uint256 liquidity)
         internal
-        returns (bytes32)
+        view
+        returns (AttestationRequestData memory)
     {
         bytes memory data = abi.encode("NUT_LP", caller, usdcTotal, usdcToLp, nutBought, liquidity, block.timestamp);
-        return eas.attest(
-            AttestationRequest({
-                schema: lpSchemaUID,
-                data: AttestationRequestData({
-                    recipient: caller, expirationTime: 0, revocable: false, refUID: bytes32(0), data: data, value: 0
-                })
-            })
-        );
+        return AttestationRequestData({
+            recipient: caller, expirationTime: 0, revocable: false, refUID: bytes32(0), data: data, value: 0
+        });
     }
 
     // ═══════════════ ADMIN ═══════════════
@@ -427,6 +487,9 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         pipsBps = newBps;
     }
 
+    /// @dev Lowering maxUsdcPerWindow below the current rolling spend gates
+    ///      operator execution only until entries age out (bounded by 24h);
+    ///      the window self-heals as checkpoints expire.
     function setCaps(uint256 maxUsdc_, uint256 horizon_, uint256 maxWindow_) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (maxUsdc_ == 0 || horizon_ == 0) revert BadCap();
         if (maxWindow_ < maxUsdc_) revert BadWindow();
@@ -434,14 +497,6 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         maxDeadlineHorizon = horizon_;
         maxUsdcPerWindow = maxWindow_;
         emit CapsUpdated(maxUsdc_, horizon_, maxWindow_);
-    }
-
-    function setSchemaUIDs(bytes32 pipsSchema_, bytes32 lpSchema_) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (!_schemaMatches(schemaRegistry, pipsSchema_, PIPS_SCHEMA_DEF)) revert SchemaNotFound();
-        if (!_schemaMatches(schemaRegistry, lpSchema_, LP_SCHEMA_DEF)) revert SchemaNotFound();
-        pipsSchemaUID = pipsSchema_;
-        lpSchemaUID = lpSchema_;
-        emit SchemaUIDsUpdated(pipsSchema_, lpSchema_);
     }
 
     function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {

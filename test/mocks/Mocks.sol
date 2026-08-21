@@ -2,7 +2,9 @@
 pragma solidity ^0.8.24;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {AttestationRequest} from "@eas/contracts/IEAS.sol";
+import {FeeRouter} from "../../src/router/FeeRouter.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {AttestationRequest, MultiAttestationRequest} from "@eas/contracts/IEAS.sol";
 import {ISchemaRegistry, SchemaRecord} from "@eas/contracts/ISchemaRegistry.sol";
 import {ISchemaResolver} from "@eas/contracts/resolver/ISchemaResolver.sol";
 
@@ -32,12 +34,34 @@ contract MockPair is ERC20 {
     address public immutable token0;
     address public immutable token1;
 
+    // ── Canonical Aerodrome Pool.fee claim semantics ──
+    // Fees accrue to LP holders; claimFees() pays the CALLING holder and
+    // resets their claimable. Test harness sets pending fees directly.
+    mapping(address => uint256) public claimable0;
+    mapping(address => uint256) public claimable1;
+
     constructor(address a, address b) ERC20("Mock LP", "MLP") {
         (token0, token1) = a < b ? (a, b) : (b, a);
     }
 
     function mint(address to, uint256 amt) external {
         _mint(to, amt);
+    }
+
+    /// @dev Test helper: accrue pending fees for an LP holder.
+    function accrueFees(address holder, uint256 amt0, uint256 amt1) external {
+        claimable0[holder] += amt0;
+        claimable1[holder] += amt1;
+    }
+
+    /// @dev Canonical shape: pays caller, returns claimed amounts, resets.
+    function claimFees() external returns (uint256 claimed0, uint256 claimed1) {
+        claimed0 = claimable0[msg.sender];
+        claimed1 = claimable1[msg.sender];
+        claimable0[msg.sender] = 0;
+        claimable1[msg.sender] = 0;
+        IERC20(token0).transfer(msg.sender, claimed0);
+        IERC20(token1).transfer(msg.sender, claimed1);
     }
 }
 
@@ -84,6 +108,27 @@ contract MockEAS {
         attestCount++;
         uid = keccak256(abi.encodePacked(attestCount, request.schema, request.data.recipient));
         exists[uid] = true;
+    }
+
+    /// @dev Canonical EAS multiAttest: one UID per data entry, all-or-nothing.
+    function multiAttest(MultiAttestationRequest[] calldata requests)
+        external
+        payable
+        returns (bytes32[] memory uids)
+    {
+        uids = new bytes32[](requests.length);
+        for (uint256 i; i < requests.length; ++i) {
+            SchemaRecord memory rec = registry.getSchema(requests[i].schema);
+            if (rec.uid == bytes32(0)) revert NotFound();
+        }
+        for (uint256 i; i < requests.length; ++i) {
+            for (uint256 j; j < requests[i].data.length; ++j) {
+                attestCount++;
+                uids[i + j] =
+                    keccak256(abi.encodePacked(attestCount, requests[i].schema, requests[i].data[j].recipient));
+                exists[uids[i + j]] = true;
+            }
+        }
     }
 }
 
@@ -288,5 +333,102 @@ contract SixDecimalToken is ERC20 {
 
     function mint(address to, uint256 amt) external {
         _mint(to, amt);
+    }
+}
+
+// ═══════════════ REENTRANCY HARNESS (round 6) ═══════════════
+
+/// @dev Reenters FeeRouter.splitAndDeploy from inside buyPips.
+contract ReentrantPipsBuyer {
+    MockUSDC public immutable usdc;
+    MockERC20 public immutable pips;
+    address public target;
+
+    constructor(address usdc_, address pips_) {
+        usdc = MockUSDC(usdc_);
+        pips = MockERC20(pips_);
+    }
+
+    function setTarget(address t) external {
+        target = t;
+    }
+
+    function buyPips(uint256 usdcAmount) external returns (uint256) {
+        usdc.transferFrom(msg.sender, address(this), usdcAmount);
+        if (target != address(0)) {
+            // Nested attempt — MUST hit ReentrancyGuard and bubble up.
+            try FeeRouter(target).splitAndDeploy(
+                usdcAmount, 1, 1, 1, 1, 1, block.timestamp + 600
+            ) {
+                revert("REENTRANCY NOT BLOCKED");
+            } catch {
+                revert("NESTED REVERT EXPECTED");
+            }
+        }
+        pips.mint(msg.sender, usdcAmount * 2e12);
+        return usdcAmount * 2e12;
+    }
+}
+
+/// @dev Malicious LP pair: reenters deployResiduals (via mint) or claimLpFees
+///      (via claimFees) depending on mode.
+contract MaliciousPair is ERC20 {
+    enum Mode { OFF, REENTER_DEPLOY, REENTER_CLAIM }
+    address public immutable token0;
+    address public immutable token1;
+    Mode public mode = Mode.OFF;
+    address public target;
+    mapping(address => uint256) public claimable0;
+    mapping(address => uint256) public claimable1;
+
+    constructor(address a, address b) ERC20("Evil LP", "ELP") {
+        (token0, token1) = a < b ? (a, b) : (b, a);
+    }
+
+    function setMode(Mode m) external {
+        mode = m;
+    }
+
+    function setTarget(address t) external {
+        target = t;
+    }
+
+    function accrueFees(address holder, uint256 amt0, uint256 amt1) external {
+        claimable0[holder] += amt0;
+        claimable1[holder] += amt1;
+    }
+
+    function mint(address, uint256) external {
+        if (mode == Mode.REENTER_DEPLOY && target != address(0)) {
+            FeeRouter(target).deployResiduals(1, 1, 1, block.timestamp + 600); // must revert
+        }
+        // then reverts itself via failed nested call bubbling
+    }
+
+    function claimFees() external returns (uint256, uint256) {
+        if (mode == Mode.REENTER_CLAIM && target != address(0)) {
+            FeeRouter(target).claimLpFees(); // must revert
+        }
+        revert("NESTED REVERT EXPECTED");
+    }
+}
+
+/// @dev LpRouter bound to MaliciousPair (type-correct ctor).
+contract EvilLpRouter {
+    MaliciousPair public pair;
+    constructor(MaliciousPair pair_) { pair = pair_; }
+    function addLiquidity(
+        address tokenA, address tokenB,
+        uint256 amountADesired, uint256 amountBDesired,
+        uint256 amountAMin, uint256 amountBMin,
+        address to, uint256
+    ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity) {
+        require(amountADesired >= amountAMin && amountBDesired >= amountBMin, "MIN_AMOUNTS");
+        MockERC20(tokenA).transferFrom(msg.sender, address(this), amountADesired);
+        MockERC20(tokenB).transferFrom(msg.sender, address(this), amountBDesired);
+        amountA = amountADesired;
+        amountB = amountBDesired;
+        liquidity = (amountA * amountB) / 1e12;
+        pair.mint(to, liquidity);
     }
 }

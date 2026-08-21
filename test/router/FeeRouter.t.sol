@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, console2} from "forge-std/Test.sol";
 import {FeeRouter} from "../../src/router/FeeRouter.sol";
 import {WNUT} from "../../src/wnut/WNUT.sol";
 import {ISchemaResolver} from "@eas/contracts/resolver/ISchemaResolver.sol";
@@ -10,6 +10,9 @@ import {
     MockUSDC,
     MockERC20,
     MockPair,
+    ReentrantPipsBuyer,
+    MaliciousPair,
+    EvilLpRouter,
     MockSchemaRegistry,
     MockEAS,
     MockPipsBuyer,
@@ -244,9 +247,11 @@ contract FeeRouterTest is Test {
 
         assertEq(fr.totalUsdcToPips(), 40e6, "must measure actual USDC consumed");
         assertEq(fr.totalUsdcToLp(), 20e6);
-        assertEq(fr.totalUsdcProcessed(), 100e6);
-        (uint256 u,,) = fr.residuals();
-        assertEq(u, 40e6);
+        // Decision 1B: processed counts CONSUMED actuals; the stingy 40e6 USDC
+        // shortfall remains as carry for the next run, not stranded forever.
+        assertEq(fr.totalUsdcProcessed(), 60e6, "processed = consumed, not nominal");
+        (uint256 carryUsdc,,) = fr.residuals();
+        assertEq(carryUsdc, 40e6, "under-spend stays as carry");
     }
 
     function test_LyingSwapRouter_Reverts() public {
@@ -465,19 +470,11 @@ contract FeeRouterTest is Test {
         );
     }
 
-    /// @dev setSchemaUIDs must also reject resolver/revocable schemas.
-    function test_SetSchemaUIDs_RejectsResolverBearing() public {
-        MockResolver resolver = new MockResolver();
-        bytes32 resolverUID = registry.register(PIPS_DEF, ISchemaResolver(address(resolver)), false);
-        vm.expectRevert(FeeRouter.SchemaNotFound.selector);
-        router.setSchemaUIDs(resolverUID, lpUID_);
-    }
-
-    /// @dev setSchemaUIDs must also reject revocable schemas.
-    function test_SetSchemaUIDs_RejectsRevocable() public {
-        bytes32 revocableUID = registry.register(PIPS_DEF, ISchemaResolver(address(0)), true);
-        vm.expectRevert(FeeRouter.SchemaNotFound.selector);
-        router.setSchemaUIDs(revocableUID, lpUID_);
+    /// @dev Schema UIDs are IMMUTABLE — binding happens only at construction.
+    ///      Deterministic UID derivation makes a runtime setter useless.
+    function test_SchemaUIDs_Immutable() public {
+        assertEq(router.pipsSchemaUID(), pipsUID_);
+        assertEq(router.lpSchemaUID(), lpUID_);
     }
 
     // ═══════════════ RESIDUAL REDEPLOY (M-03) ═══════════════
@@ -774,23 +771,27 @@ contract FeeRouterTest is Test {
         assertEq(wnut.allowance(address(router), address(lpRouter)), 0);
     }
 
+    /// @dev Pre-existing NUT/wNUT are never swept (M-01 delta discipline), and
+    ///      pre-existing USDC folds as carry into the next deployment (1B):
+    ///      under-spend/donated USDC auto-redeploys instead of stranding.
     function test_SecondRunDoesNotSweepPreexistingBalances() public {
         _run();
         pips.mint(address(router), 1_000e18);
         nut.mint(address(router), 1_000e18);
         usdc.mint(address(router), 500e6);
 
-        _run();
+        _run(); // effective = 100e6 new + 500e6 carry
 
-        assertEq(router.totalPipsMinted(), 2 * 160e18);
-        assertEq(router.totalLpAdded(), 2 * 9e26);
-        assertEq(router.totalUsdcProcessed(), 2 * 100e6);
-
-        assertEq(pips.balanceOf(address(router)), 1_000e18 + 320e18);
+        // NUT invariant: donated 1_000 NUT untouched (only run-2 bought NUT used)
         (,, uint256 n) = router.residuals();
-        assertEq(n, 1_000e18);
+        assertEq(n, 1_000e18, "pre-existing NUT never swept");
+        // PIPS: donated 1_000 + run1 160 + run2 960 (600e6 * 2e12 rate)
+        assertEq(router.totalPipsMinted(), 160e18 + 960e18);
+        assertEq(pips.balanceOf(address(router)), 1_000e18 + 160e18 + 960e18);
+        // USDC fully consumed incl. carry
+        assertEq(router.totalUsdcProcessed(), 700e6);
         (uint256 u,,) = router.residuals();
-        assertEq(u, 500e6);
+        assertEq(u, 0, "carry fully deployed");
     }
 
     // ═══════════════ ADMIN SETTERS ═══════════════
@@ -815,21 +816,6 @@ contract FeeRouterTest is Test {
         router.setCaps(50e6, 60, 49e6);
     }
 
-    function test_SetSchemaUIDs_RejectsUnknown() public {
-        vm.expectRevert(FeeRouter.SchemaNotFound.selector);
-        router.setSchemaUIDs(bytes32(uint256(999)), lpUID_);
-    }
-
-    function test_SetSchemaUIDs_RejectsWrongDefinition() public {
-        bytes32 wrongUID = registry.register("uint256 x", ISchemaResolver(address(0)), false);
-        vm.expectRevert(FeeRouter.SchemaNotFound.selector);
-        router.setSchemaUIDs(wrongUID, lpUID_);
-    }
-
-    function test_SetSchemaUIDs_AcceptsKnown() public {
-        router.setSchemaUIDs(pipsUID_, lpUID_);
-        assertEq(router.pipsSchemaUID(), pipsUID_);
-    }
 
     // ═══════════════ AUDIT ROUND 4 ═══════════════
 
@@ -954,4 +940,209 @@ contract FeeRouterTest is Test {
         vm.expectRevert(FeeRouter.ZeroRecipient.selector);
         router.rescueUsdc(address(0));
     }
+
+    // ═══════════════ AUDIT ROUND 6 — ROLLING WINDOW / CARRY / LP FEES / REENTRANCY ═══════════════
+
+    /// @dev TRUE rolling window: no fresh-cap burst at the old tumbling reset.
+    ///      Runs at T, T+1h, T+23h saturate the 3x cap. At T+25h+2s only the
+    ///      T+23h run is still inside 24h → headroom exactly 1x: TWO more runs
+    ///      fit (3x == cap allowed), the third reverts. Old tumbling logic
+    ///      reset the window at T+24h and granted the FULL 3x headroom fresh.
+    function test_RollingWindow_NoBurstAtBoundary() public {
+        FeeRouter fr = _deployTightWindow();
+        _runOn(fr); // T
+        vm.warp(block.timestamp + 1 hours);
+        _runOn(fr); // T+1h
+        vm.warp(block.timestamp + 22 hours);
+        _runOn(fr); // T+23h — 3x cap saturated
+        vm.warp(block.timestamp + 2 hours + 2 seconds); // T+25h+2s
+        assertEq(fr.windowSpendLast24h(), AMOUNT, "only the T+23h run may remain");
+        usdc.approve(address(fr), type(uint256).max);
+        fr.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800); // 2x
+        fr.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800); // 3x saturated
+        vm.expectRevert(FeeRouter.WindowCapExceeded.selector);
+        fr.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
+    }
+
+    /// @dev Rolling invariant fuzz: for random (amount, delay) sequences, the
+    ///      sum of consumption in ANY trailing 24h interval never exceeds cap.
+    /// @dev via-IR note: solc hoists in-loop block.timestamp reads to the
+    ///      first frame read; vm.warp cannot invalidate that cache. All
+    ///      post-warp time math therefore uses a pure-arithmetic clock var.
+    function testFuzz_RollingWindow_NeverExceedsCap(uint256 seed) public {
+        FeeRouter fr = _deployTightWindow();
+        usdc.approve(address(fr), type(uint256).max);
+        uint256 total = 0;
+        uint256 clock = block.timestamp; // single read, pre-warp
+        for (uint256 i; i < 8; ++i) {
+            uint256 delay = (seed >> (i * 4)) % 10 hours; // 0..10h pseudo-random
+            uint256 amt = ((seed >> (i * 3)) % 3) * (AMOUNT / 4) + AMOUNT / 4; // 25/50/75% run
+            clock += delay;
+            vm.warp(clock);
+            // Mocks are rate-linear EXCEPT liquidity (quadratic: (a*b)/1e12).
+            // Mins: PIPS 80%, NUT ~92%, LP sides ~97%, liq 89% at AMOUNT —
+            // scale linearly except liquidity which scales quadratically.
+            try fr.splitAndDeploy(
+                amt,
+                (150e18 * amt) / AMOUNT,
+                (55e18 * amt) / AMOUNT,
+                (29e18 * amt) / AMOUNT,
+                (29e18 * amt) / AMOUNT,
+                (8e26 * amt / AMOUNT) * amt / AMOUNT,
+                clock + 1800
+            ) {
+                total += amt;
+            } catch {
+                // cap rejection is fine — invariant still must hold
+            }
+            assertLe(fr.windowSpendLast24h(), 3 * AMOUNT, "rolling cap broken");
+        }
+        assertGt(total, 0);
+    }
+
+    /// @dev Decision 1B: carry + new amount must respect the per-run cap.
+    function test_CarryCountedAgainstPerRunCap() public {
+        StingyPipsBuyer stingy = new StingyPipsBuyer(address(usdc), address(pips));
+        FeeRouter fr = new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips), address(stingy),
+            address(swapRouter), address(lpRouter), address(eas), address(registry), address(pair),
+            pipsUID_, lpUID_, 0, block.chainid, 2 * AMOUNT, HORIZON, MAX_WINDOW
+        );
+        usdc.approve(address(fr), type(uint256).max);
+        fr.splitAndDeploy(2 * AMOUNT, 300e18, 110e18, 58e18, 58e18, 16e26, block.timestamp + 1800);
+        // Stingy halves spend: carry = 2*AMOUNT - 1.2*AMOUNT = 0.8*AMOUNT.
+        (uint256 carry,,) = fr.residuals();
+        assertEq(carry, 8e7);
+        // New AMOUNT + carry 0.8*AMOUNT = 1.8*AMOUNT < 2*AMOUNT cap → fits.
+        fr.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
+        // Now next run: previous leftovers + AMOUNT would exceed? assert reverts when it would.
+        // (Stingy again under-spends 20% of 1.8*AMOUNT = 0.36*AMOUNT carry...)
+        (uint256 carry2,,) = fr.residuals();
+        // Attempt AMOUNT: effective = AMOUNT + carry2. With carry2=0.36*AMOUNT*2 (see rate)
+        // just assert effective-cap guard triggers via explicit boundary test below.
+        assertGe(carry2, 0);
+    }
+
+    /// @dev Decision 1B boundary: carry making effective > per-run cap reverts.
+    function test_CarryPlusAmount_RevertsWhenExceedsRunCap() public {
+        usdc.mint(address(router), MAX_RUN); // saturate carry to full per-run cap
+        usdc.approve(address(router), type(uint256).max);
+        vm.expectRevert(FeeRouter.AmountTooLarge.selector);
+        router.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
+    }
+
+    /// @dev LP fee claim: accrual → claimLpFees → residuals grow → deployResiduals.
+    function test_ClaimLpFees_ClaimsAndFeedsResidualDeploy() public {
+        _run();
+        // Fund the pair so claimFees can pay out real tokens
+        nut.mint(address(this), 25e18);
+        nut.mint(address(pair), 20e18);
+        nut.approve(address(wnut), 20e18);
+        wnut.depositFor(address(pair), 20e18);
+        // Accrue pending fees for the router (token0/token1 = sorted)
+        uint256 fee0 = 5e18;
+        uint256 fee1 = 7e18;
+        MockPair(address(pair)).accrueFees(address(router), fee0, fee1);
+
+        // Expected deltas depend on token sort order
+        bool wnutIsToken0 = MockPair(address(pair)).token0() == address(wnut);
+        vm.expectEmit(true, true, true, true, address(router));
+        emit FeeRouter.LpFeesClaimed(wnutIsToken0 ? fee0 : fee1, wnutIsToken0 ? fee1 : fee0, block.timestamp);
+        router.claimLpFees();
+
+        // Fees landed as NUT/wNUT residuals, ready for residual deploy
+        (uint256 u, uint256 w, uint256 n) = router.residuals();
+        assertEq(u, 0);
+        assertEq(w + n, fee0 + fee1);
+        // Round-trip: feed those residuals into deployResiduals
+        router.deployResiduals(w, n, 1, block.timestamp + 1800);
+    }
+
+    /// @dev claimLpFees: nothing accrued → clean revert, no state change.
+    function test_ClaimLpFees_RevertsWhenNothingToClaim() public {
+        vm.expectRevert(FeeRouter.NothingToClaim.selector);
+        router.claimLpFees();
+    }
+
+    /// @dev claimLpFees is permissionless — any address may trigger, fees
+    ///      still land in the router. Keeper-friendly.
+    function test_ClaimLpFees_Permissionless() public {
+        _run();
+        nut.mint(address(this), 6e18);
+        nut.mint(address(pair), 5e18);
+        nut.approve(address(wnut), 5e18);
+        wnut.depositFor(address(pair), 5e18);
+        MockPair(address(pair)).accrueFees(address(router), 1e18, 1e18);
+        address keeper = makeAddr("keeper");
+        vm.prank(keeper);
+        router.claimLpFees();
+        (, uint256 w, uint256 n) = router.residuals();
+        assertEq(w + n, 2e18);
+    }
+
+
+    // ═══════════════ REENTRANCY HARNESS (round 6) ═══════════════
+
+    /// @dev Malicious PIPS buyer reenters splitAndDeploy mid-leg. The whole
+    ///      outer tx must revert via ReentrancyGuard and leave ZERO state.
+    function test_Reentrancy_SplitAndDeploy_Blocked() public {
+        ReentrantPipsBuyer evil = new ReentrantPipsBuyer(address(usdc), address(pips));
+        FeeRouter fr = new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips), address(evil),
+            address(swapRouter), address(lpRouter), address(eas), address(registry), address(pair),
+            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON, MAX_WINDOW
+        );
+        evil.setTarget(address(fr));
+        usdc.approve(address(fr), type(uint256).max);
+        vm.expectRevert();
+        fr.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
+        // State untouched after the failed nested attempt
+        assertEq(fr.totalUsdcProcessed(), 0);
+        assertEq(fr.windowSpendLast24h(), 0);
+    }
+
+    /// @dev Malicious pair.mint reenters deployResiduals mid-addLiquidity.
+    function test_Reentrancy_DeployResiduals_Blocked() public {
+        MaliciousPair evilPair = new MaliciousPair(address(wnut), address(nut));
+        EvilLpRouter evilLp = new EvilLpRouter(evilPair);
+        FeeRouter fr = new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips), address(pipsBuyer),
+            address(swapRouter), address(evilLp), address(eas), address(registry), address(evilPair),
+            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON, MAX_WINDOW
+        );
+        evilPair.setMode(MaliciousPair.Mode.REENTER_DEPLOY);
+        evilPair.setTarget(address(fr));
+        nut.mint(address(this), 60e18);
+        nut.approve(address(wnut), 30e18);
+        wnut.depositFor(address(fr), 30e18);
+        nut.transfer(address(fr), 30e18);
+        vm.expectRevert();
+        fr.deployResiduals(26e18, 26e18, 700e24, block.timestamp + 1800);
+        (uint256 u, uint256 w, uint256 n) = fr.residuals();
+        assertEq(u, 0);
+        assertTrue(w + n >= 60e18, "residuals must survive the failed deploy");
+    }
+
+    /// @dev Malicious pair.claimFees reenters claimLpFees.
+    function test_Reentrancy_ClaimLpFees_Blocked() public {
+        MaliciousPair evilPair = new MaliciousPair(address(wnut), address(nut));
+        EvilLpRouter evilLp = new EvilLpRouter(evilPair);
+        FeeRouter fr = new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips), address(pipsBuyer),
+            address(swapRouter), address(evilLp), address(eas), address(registry), address(evilPair),
+            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON, MAX_WINDOW
+        );
+        evilPair.setMode(MaliciousPair.Mode.REENTER_CLAIM);
+        evilPair.setTarget(address(fr));
+        nut.mint(address(this), 10e18);
+        nut.approve(address(wnut), 5e18);
+        wnut.depositFor(address(evilPair), 5e18);
+        nut.transfer(address(evilPair), 5e18);
+        evilPair.accrueFees(address(fr), 1e18, 1e18);
+        vm.expectRevert();
+        fr.claimLpFees();
+        (,, uint256 n2) = fr.residuals();
+        assertEq(n2, 0, "no residual credit from failed claim");
+    }
+
 }

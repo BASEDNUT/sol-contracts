@@ -9,7 +9,7 @@ Deploys incoming USDC revenue across two legs, emitting an EAS attestation per l
 - LP leg: swaps USDC -> NUT, wraps half to wNUT, adds wNUT/NUT liquidity — **all outputs measured by balance deltas** (USDC spent, NUT received, LP received)
 - Attestations: EAS (Base predeploy `0x4200000000000000000000000000000000000021`), registry-bound (`eas.getSchemaRegistry() == schemaRegistry` enforced) and **schema-definition-bound** (UID must match the canonical schema string), validated at construction and on update
 - All slippage bounds, min-outputs, and deadline are caller-supplied and enforced on-chain; zero bounds revert
-- Contract-level operator caps: `maxUsdcPerRun`, `maxDeadlineHorizon` — operator cannot bypass with `min=1` + far-future deadline
+- Contract-level operator caps bound VOLUME and TIMING only: `maxUsdcPerRun`, true rolling `maxUsdcPerWindow` (any 24h interval), `maxDeadlineHorizon`. The PRICE envelope (`min*Out` bounds) is operator-owned by design — OPERATOR is trusted for execution economics; a compromised key can trade at bad prices up to the caps. Guard the key.
 
 ## Security
 
@@ -33,3 +33,12 @@ Deploys incoming USDC revenue across two legs, emitting an EAS attestation per l
 
 - `test/router/FeeRouter.t.sol` — unit + adversarial adapters
 - `test/integration/BaseFork.t.sol` — real Base EAS/SchemaRegistry fork gate
+
+
+## Round 6 mechanics
+
+- **True rolling 24h cap** — timestamped spend checkpoints; no spend older than 24h counts toward the cap. No 2x burst at any boundary.
+- **USDC carry fold** — under-spent or donated USDC folds into the next `splitAndDeploy` (allocation ceiling semantics, not forced spend). Carry + new amount must fit `maxUsdcPerRun`.
+- **`claimLpFees()`** — permissionless; claims Aerodrome pool fees to the router, feeding NUT/wNUT residuals for `deployResiduals()`.
+- **EAS `multiAttest`** — both attestations batched in one call.
+- **Schema UIDs immutable** — deterministic UID derivation makes a runtime setter useless; binding only at construction.
