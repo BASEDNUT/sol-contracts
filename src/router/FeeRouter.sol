@@ -7,49 +7,69 @@ import {AccessControlDefaultAdminRules} from "@openzeppelin/contracts/access/ext
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
+import {IEAS} from "@eas/contracts/IEAS.sol";
+import {ISchemaRegistry, SchemaRecord} from "@eas/contracts/ISchemaRegistry.sol";
+import {AttestationRequest, AttestationRequestData} from "@eas/contracts/IEAS.sol";
+
 import {WNUT} from "../wnut/WNUT.sol";
 import {IPipsBuyer} from "../interfaces/IPipsBuyer.sol";
 import {ISwapRouter, IAddLiquidityRouter} from "../interfaces/ISwapRouter.sol";
-import {IEAS, ISchemaRegistry, AttestationRequest, AttestationData} from "../interfaces/EAS.sol";
+
+interface IERC20Pair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+}
 
 /**
  * @title FeeRouter — NUT Credit Protocol fee deployment engine
  * @notice Splits incoming USDC:
  *         80% -> PIPS mint leg (via IPipsBuyer adapter, balance-delta verified)
  *         20% -> NUT LP leg  (USDC->NUT swap, wrap half -> wNUT, add wNUT/NUT liquidity)
- *         Every run emits two EAS attestations (Base predeploy 0x4200...0021).
+ *         Every run emits two EAS attestations.
  *
  * Security model:
- *         - Single authority: DEFAULT_ADMIN_ROLE (timelocked via AccessControlDefaultAdminRules).
- *           No Ownable. Admin transfer is 2-step + delayed.
- *         - OPERATOR_ROLE: may call splitAndDeploy with explicit slippage bounds.
- *         - LP position is PROTOCOL-OWNED and NOT withdrawable by admin. LP tokens cannot
- *           be swept by any function. PIPS accumulated may be swept by admin (treasury custody).
- *         - USDC rescue only while paused (blacklist/emergency).
+ *         - Single authority: DEFAULT_ADMIN_ROLE with delayed 2-step transfer
+ *           (AccessControlDefaultAdminRules). This is NOT an execution timelock:
+ *           admin parameter changes and recovery execute immediately.
+ *         - OPERATOR_ROLE: calls splitAndDeploy with explicit bounds; bound by
+ *           contract-level caps (maxUsdcPerRun, maxDeadlineHorizon).
+ *         - LP position is protocol-owned and NOT withdrawable by admin. LP token
+ *           is denylisted from recovery and pair-validated at construction.
+ *         - All economic quantities are measured by balance deltas, never by
+ *           external call return values.
+ *         - Venue integration via adapter contracts (see src/adapters/).
  */
 contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
 
+    // ── Canonical schema definitions (attestation payload ABI) ──
+    string public constant PIPS_SCHEMA_DEF =
+        "string action,address caller,uint256 usdcTotal,uint256 usdcToPips,uint256 pipsMinted,uint256 timestamp";
+    string public constant LP_SCHEMA_DEF =
+        "string action,address caller,uint256 usdcTotal,uint256 usdcToLp,uint256 nutBought,uint256 liquidity,uint256 timestamp";
+
     // ── Immutable config ──
     IERC20 public immutable usdc;
     IERC20 public immutable nut;
     WNUT public immutable wnut;
-    IERC20 public immutable pips;             // PIPS token for balance-delta verification
-    IPipsBuyer public immutable pipsBuyer;    // adapter seam
-    ISwapRouter public immutable swapRouter;  // USDC -> NUT
-    IAddLiquidityRouter public immutable lpRouter; // wNUT/NUT pool
+    IERC20 public immutable pips;
+    IPipsBuyer public immutable pipsBuyer;      // adapter seam
+    ISwapRouter public immutable swapRouter;    // USDC -> NUT adapter
+    IAddLiquidityRouter public immutable lpRouter; // wNUT/NUT LP adapter
     IEAS public immutable eas;
-    ISchemaRegistry public immutable schemaRegistry; // schema existence validation
-    IERC20 public immutable lpToken; // wNUT/NUT pool LP token — protocol-owned, never sweepable
+    ISchemaRegistry public immutable schemaRegistry;
+    IERC20 public immutable lpToken; // wNUT/NUT pool LP — protocol-owned, never sweepable
 
     // ── Mutable config (admin-settable) ──
-    uint256 public pipsBps;      // 8000 = 80%
+    uint256 public pipsBps;          // 8000 = 80%
+    uint256 public maxUsdcPerRun;    // operator execution cap
+    uint256 public maxDeadlineHorizon; // seconds; deadline - now must not exceed
     bytes32 public pipsSchemaUID;
     bytes32 public lpSchemaUID;
 
-    // ── Accounting ──
+    // ── Accounting (balance-delta measured) ──
     uint256 public totalUsdcProcessed;
     uint256 public totalUsdcToPips;
     uint256 public totalUsdcToLp;
@@ -69,8 +89,10 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         bytes32 lpAttestationUID,
         uint256 timestamp
     );
+    event ResidualsCarried(uint256 usdc, uint256 wnut, uint256 nut);
     event PipsBpsUpdated(uint256 oldBps, uint256 newBps);
     event SchemaUIDsUpdated(bytes32 pipsSchema, bytes32 lpSchema);
+    event CapsUpdated(uint256 maxUsdcPerRun, uint256 maxDeadlineHorizon);
     event PipsRecovered(address indexed to, uint256 amount);
     event DustRecovered(address indexed token, address indexed to, uint256 amount);
     event UsdcRescued(address indexed to, uint256 amount);
@@ -79,15 +101,21 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
     error ZeroAmount();
     error BadSplit();
     error DeadlineExpired();
+    error DeadlineTooFar();
     error ZeroSlippageBound();
     error InsufficientPips();
     error InsufficientNut();
+    error InsufficientLiquidity();
+    error AmountTooLarge();
     error ProtectedToken();
     error ChainMismatch();
     error BadDependency();
+    error RegistryMismatch();
+    error BadLpToken();
     error SchemaNotFound();
     error NothingToRecover();
     error NothingToRescue();
+    error BadCap();
 
     constructor(
         address usdc_,
@@ -103,7 +131,9 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         bytes32 pipsSchemaUID_,
         bytes32 lpSchemaUID_,
         uint48 adminDelay_,
-        uint256 expectedChainId_
+        uint256 expectedChainId_,
+        uint256 maxUsdcPerRun_,
+        uint256 maxDeadlineHorizon_
     )
         AccessControlDefaultAdminRules(adminDelay_, msg.sender)
     {
@@ -111,16 +141,30 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
             usdc_ == address(0) || nut_ == address(0) || wnut_ == address(0)
             || pips_ == address(0) || pipsBuyer_ == address(0) || swapRouter_ == address(0)
             || lpRouter_ == address(0) || eas_ == address(0) || schemaRegistry_ == address(0)
-            || lpToken_ == address(0) || lpToken_.code.length == 0
-            || usdc_.code.length == 0 || nut_.code.length == 0 || wnut_.code.length == 0
-            || pips_.code.length == 0 || pipsBuyer_.code.length == 0 || swapRouter_.code.length == 0
-            || lpRouter_.code.length == 0 || eas_.code.length == 0 || schemaRegistry_.code.length == 0
+            || lpToken_ == address(0) || usdc_.code.length == 0 || nut_.code.length == 0
+            || wnut_.code.length == 0 || pips_.code.length == 0 || pipsBuyer_.code.length == 0
+            || swapRouter_.code.length == 0 || lpRouter_.code.length == 0 || eas_.code.length == 0
+            || schemaRegistry_.code.length == 0 || lpToken_.code.length == 0
         ) revert BadDependency();
 
         if (block.chainid != expectedChainId_) revert ChainMismatch();
         if (WNUT(wnut_).underlyingNUT() != nut_) revert BadDependency();
-        if (!_schemaExists(schemaRegistry_, pipsSchemaUID_)) revert SchemaNotFound();
-        if (!_schemaExists(schemaRegistry_, lpSchemaUID_)) revert SchemaNotFound();
+        if (IEAS(eas_).getSchemaRegistry() != ISchemaRegistry(schemaRegistry_)) revert RegistryMismatch();
+
+        // LP token must be the canonical wNUT/NUT pair
+        address t0 = IERC20Pair(lpToken_).token0();
+        address t1 = IERC20Pair(lpToken_).token1();
+        if (!((t0 == wnut_ && t1 == nut_) || (t0 == nut_ && t1 == wnut_))) revert BadLpToken();
+
+        // Schemas must exist in the bound registry AND match canonical definitions
+        if (!_schemaMatches(ISchemaRegistry(schemaRegistry_), pipsSchemaUID_, PIPS_SCHEMA_DEF)) {
+            revert SchemaNotFound();
+        }
+        if (!_schemaMatches(ISchemaRegistry(schemaRegistry_), lpSchemaUID_, LP_SCHEMA_DEF)) {
+            revert SchemaNotFound();
+        }
+
+        if (maxUsdcPerRun_ == 0 || maxDeadlineHorizon_ == 0) revert BadCap();
 
         usdc = IERC20(usdc_);
         nut = IERC20(nut_);
@@ -134,6 +178,8 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         lpToken = IERC20(lpToken_);
 
         pipsBps = 8000;
+        maxUsdcPerRun = maxUsdcPerRun_;
+        maxDeadlineHorizon = maxDeadlineHorizon_;
         pipsSchemaUID = pipsSchemaUID_;
         lpSchemaUID = lpSchemaUID_;
 
@@ -143,15 +189,16 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
     // ═══════════════ CORE ENTRY ═══════════════
 
     /**
-     * @notice Split USDC and deploy both legs. Operator-only.
-     * @dev Caller must approve this contract for `usdcAmount` beforehand.
-     *      All slippage bounds are caller-supplied and enforced on-chain.
-     * @param usdcAmount  total USDC to process
-     * @param minPipsOut  minimum PIPS received by router (balance-delta verified)
-     * @param minNutOut   minimum NUT out of the USDC->NUT swap
-     * @param minLpWnut   minimum wNUT side accepted by addLiquidity
-     * @param minLpNut    minimum NUT side accepted by addLiquidity
-     * @param deadline    latest timestamp the swap+LP may execute
+     * @notice Split USDC and deploy both legs. Operator-only, cap-bounded.
+     * @dev All outputs measured by balance deltas. Return values of external
+     *      adapters are never trusted for accounting.
+     * @param usdcAmount       total USDC to process (<= maxUsdcPerRun)
+     * @param minPipsOut       minimum PIPS balance delta
+     * @param minNutOut        minimum NUT balance delta from swap
+     * @param minLpWnut        minimum wNUT side accepted by addLiquidity
+     * @param minLpNut         minimum NUT side accepted by addLiquidity
+     * @param minLiquidityOut  minimum LP token balance delta
+     * @param deadline         execution deadline (<= now + maxDeadlineHorizon)
      */
     function splitAndDeploy(
         uint256 usdcAmount,
@@ -159,6 +206,7 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         uint256 minNutOut,
         uint256 minLpWnut,
         uint256 minLpNut,
+        uint256 minLiquidityOut,
         uint256 deadline
     )
         external
@@ -168,10 +216,12 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         returns (bytes32 pipsUID, bytes32 lpUID)
     {
         if (usdcAmount == 0) revert ZeroAmount();
-        if (minPipsOut == 0 || minNutOut == 0 || minLpWnut == 0 || minLpNut == 0) {
+        if (usdcAmount > maxUsdcPerRun) revert AmountTooLarge();
+        if (minPipsOut == 0 || minNutOut == 0 || minLpWnut == 0 || minLpNut == 0 || minLiquidityOut == 0) {
             revert ZeroSlippageBound();
         }
         if (block.timestamp > deadline) revert DeadlineExpired();
+        if (deadline - block.timestamp > maxDeadlineHorizon) revert DeadlineTooFar();
 
         usdc.safeTransferFrom(msg.sender, address(this), usdcAmount);
 
@@ -180,10 +230,12 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         if (toPips == 0 || toLp == 0) revert BadSplit();
 
         // ── Leg 1: PIPS mint (80%) — balance-delta verified ──
+        uint256 usdcBeforePips = usdc.balanceOf(address(this));
         uint256 pipsBefore = pips.balanceOf(address(this));
         usdc.forceApprove(address(pipsBuyer), toPips);
         pipsBuyer.buyPips(toPips);
         usdc.forceApprove(address(pipsBuyer), 0);
+        uint256 usdcSpentOnPips = usdcBeforePips - usdc.balanceOf(address(this));
         uint256 pipsMinted = pips.balanceOf(address(this)) - pipsBefore;
         if (pipsMinted < minPipsOut) revert InsufficientPips();
 
@@ -191,25 +243,27 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         address[] memory path = new address[](2);
         path[0] = address(usdc);
         path[1] = address(nut);
+        uint256 nutBefore = nut.balanceOf(address(this));
+        uint256 usdcBeforeSwap = usdc.balanceOf(address(this));
         usdc.forceApprove(address(swapRouter), toLp);
-        uint256[] memory amounts = swapRouter.swapExactTokensForTokens(
-            toLp, minNutOut, path, address(this), deadline
-        );
+        swapRouter.swapExactTokensForTokens(toLp, minNutOut, path, address(this), deadline);
         usdc.forceApprove(address(swapRouter), 0);
-        uint256 nutBought = amounts[amounts.length - 1];
+        uint256 usdcSpentOnSwap = usdcBeforeSwap - usdc.balanceOf(address(this));
+        uint256 nutBought = nut.balanceOf(address(this)) - nutBefore;
         if (nutBought < minNutOut) revert InsufficientNut();
 
-        // Wrap exactly half -> wNUT (never sweeps pre-existing balances)
+        // Wrap exactly half of this run's NUT (never sweeps pre-existing balances)
         uint256 nutForWrap = nutBought / 2;
         uint256 nutDirect = nutBought - nutForWrap;
         nut.forceApprove(address(wnut), nutForWrap);
         wnut.depositFor(address(this), nutForWrap);
         nut.forceApprove(address(wnut), 0);
 
-        // LP exactly the amounts derived from this run
+        // LP exactly this run's amounts — liquidity measured by LP balance delta
+        uint256 lpBefore = lpToken.balanceOf(address(this));
         IERC20(address(wnut)).forceApprove(address(lpRouter), nutForWrap);
         nut.forceApprove(address(lpRouter), nutDirect);
-        (, , uint256 liquidity) = lpRouter.addLiquidity(
+        lpRouter.addLiquidity(
             address(wnut),
             address(nut),
             nutForWrap,
@@ -221,34 +275,50 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         );
         IERC20(address(wnut)).forceApprove(address(lpRouter), 0);
         nut.forceApprove(address(lpRouter), 0);
+        uint256 liquidity = lpToken.balanceOf(address(this)) - lpBefore;
+        if (liquidity < minLiquidityOut) revert InsufficientLiquidity();
 
-        // ── Accounting (before external attest calls) ──
+        // ── Accounting: actuals only, before external attest calls ──
         totalUsdcProcessed += usdcAmount;
-        totalUsdcToPips += toPips;
-        totalUsdcToLp += toLp;
+        totalUsdcToPips += usdcSpentOnPips;
+        totalUsdcToLp += usdcSpentOnSwap;
         totalPipsMinted += pipsMinted;
         totalLpAdded += liquidity;
 
+        // ── Residual accounting (M-03: stranded assets made explicit) ──
+        emit ResidualsCarried(
+            usdc.balanceOf(address(this)),
+            wnut.balanceOf(address(this)),
+            nut.balanceOf(address(this))
+        );
+
         // ── Attestations ──
-        pipsUID = _attestPips(msg.sender, usdcAmount, toPips, pipsMinted);
-        lpUID = _attestLp(msg.sender, usdcAmount, toLp, nutBought, liquidity);
+        pipsUID = _attestPips(msg.sender, usdcAmount, usdcSpentOnPips, pipsMinted);
+        lpUID = _attestLp(msg.sender, usdcAmount, usdcSpentOnSwap, nutBought, liquidity);
 
         emit FeesSplitAndDeployed(
-            msg.sender, usdcAmount, toPips, toLp, pipsMinted,
-            nutBought, liquidity, pipsUID, lpUID, block.timestamp
+            msg.sender, usdcAmount, usdcSpentOnPips, usdcSpentOnSwap,
+            pipsMinted, nutBought, liquidity, pipsUID, lpUID, block.timestamp
         );
+    }
+
+    // ═══════════════ VIEWS ═══════════════
+
+    /// @notice Current residual core-asset balances held by the router.
+    function residuals() external view returns (uint256 usdcBal, uint256 wnutBal, uint256 nutBal) {
+        return (usdc.balanceOf(address(this)), wnut.balanceOf(address(this)), nut.balanceOf(address(this)));
     }
 
     // ═══════════════ INTERNAL ═══════════════
 
-    function _schemaExists(address registry, bytes32 uid) internal view returns (bool) {
-        try ISchemaRegistry(registry).getSchema(uid) returns (
-            bytes32, address, bool, string memory, address, uint64
-        ) {
-            return true;
-        } catch {
-            return false;
-        }
+    function _schemaMatches(
+        ISchemaRegistry registry,
+        bytes32 uid,
+        string memory expectedDef
+    ) internal view returns (bool) {
+        if (uid == bytes32(0)) return false;
+        SchemaRecord memory record = registry.getSchema(uid);
+        return record.uid == uid && keccak256(bytes(record.schema)) == keccak256(bytes(expectedDef));
     }
 
     function _attestPips(
@@ -259,7 +329,7 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         );
         return eas.attest(AttestationRequest({
             schema: pipsSchemaUID,
-            data: AttestationData({
+            data: AttestationRequestData({
                 recipient: caller,
                 expirationTime: 0,
                 revocable: false,
@@ -278,7 +348,7 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         );
         return eas.attest(AttestationRequest({
             schema: lpSchemaUID,
-            data: AttestationData({
+            data: AttestationRequestData({
                 recipient: caller,
                 expirationTime: 0,
                 revocable: false,
@@ -297,12 +367,19 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         pipsBps = newBps;
     }
 
+    function setCaps(uint256 maxUsdc_, uint256 horizon_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (maxUsdc_ == 0 || horizon_ == 0) revert BadCap();
+        maxUsdcPerRun = maxUsdc_;
+        maxDeadlineHorizon = horizon_;
+        emit CapsUpdated(maxUsdc_, horizon_);
+    }
+
     function setSchemaUIDs(bytes32 pipsSchema_, bytes32 lpSchema_)
         external
         onlyRole(DEFAULT_ADMIN_ROLE)
     {
-        if (!_schemaExists(address(schemaRegistry), pipsSchema_)) revert SchemaNotFound();
-        if (!_schemaExists(address(schemaRegistry), lpSchema_)) revert SchemaNotFound();
+        if (!_schemaMatches(schemaRegistry, pipsSchema_, PIPS_SCHEMA_DEF)) revert SchemaNotFound();
+        if (!_schemaMatches(schemaRegistry, lpSchema_, LP_SCHEMA_DEF)) revert SchemaNotFound();
         pipsSchemaUID = pipsSchema_;
         lpSchemaUID = lpSchema_;
         emit SchemaUIDsUpdated(pipsSchema_, lpSchema_);
@@ -338,8 +415,7 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         return bal;
     }
 
-    /// @notice Emergency USDC rescue. Admin + PAUSED only.
-    /// @dev Covers USDC blacklist/freeze scenarios where normal flow is impossible.
+    /// @notice Emergency USDC rescue. Admin + PAUSED only (blacklist/freeze scenarios).
     function rescueUsdc(address to) external onlyRole(DEFAULT_ADMIN_ROLE) whenPaused returns (uint256) {
         uint256 bal = usdc.balanceOf(address(this));
         if (bal == 0) revert NothingToRescue();

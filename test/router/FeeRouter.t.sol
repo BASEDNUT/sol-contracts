@@ -2,221 +2,282 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {FeeRouter} from "../../src/router/FeeRouter.sol";
 import {WNUT} from "../../src/wnut/WNUT.sol";
-import {MockERC20, MockPipsBuyer, LyingPipsBuyer, MockSwapRouter, MockLpRouter, MockEAS, MockSchemaRegistry} from "../mocks/Mocks.sol";
+import {ISchemaResolver} from "@eas/contracts/resolver/ISchemaResolver.sol";
+
+import {
+    MockUSDC,
+    MockERC20,
+    MockPair,
+    MockSchemaRegistry,
+    MockEAS,
+    MockPipsBuyer,
+    LyingPipsBuyer,
+    StingyPipsBuyer,
+    MockSwapRouter,
+    LyingSwapRouter,
+    MockLpRouter,
+    SparingLpRouter,
+    LyingLpRouter
+} from "../mocks/Mocks.sol";
 
 contract FeeRouterTest is Test {
-    FeeRouter public router;
-    WNUT public wnut;
-    MockERC20 public usdc;
-    MockERC20 public nut;
-    MockERC20 public pips;
-    MockERC20 public lpToken;
-    MockPipsBuyer public pipsBuyer;
-    MockSwapRouter public swapRouter;
-    MockLpRouter public lpRouter;
-    MockEAS public eas;
-    MockSchemaRegistry public registry;
+    string constant PIPS_DEF =
+        "string action,address caller,uint256 usdcTotal,uint256 usdcToPips,uint256 pipsMinted,uint256 timestamp";
+    string constant LP_DEF =
+        "string action,address caller,uint256 usdcTotal,uint256 usdcToLp,uint256 nutBought,uint256 liquidity,uint256 timestamp";
 
-    address public operator = makeAddr("operator");
-    address public attacker = makeAddr("attacker");
-    address public treasury = makeAddr("treasury");
-    bytes32 constant PIPS_SCHEMA = keccak256("PIPS_SCHEMA");
-    bytes32 constant LP_SCHEMA = keccak256("LP_SCHEMA");
+    MockUSDC usdc;
+    MockERC20 nut;
+    WNUT wnut;
+    MockERC20 pips;
+    MockPipsBuyer pipsBuyer;
+    MockSwapRouter swapRouter;
+    MockLpRouter lpRouter;
+    MockSchemaRegistry registry;
+    MockEAS eas;
+    MockPair pair;
+    FeeRouter router;
 
-    // mock rates: 1 USDC -> 2 PIPS, 1 USDC -> 3 NUT
-    uint256 constant IN = 100e6;
-    uint256 constant EXPECT_PIPS = 160e6; // 80e6 * 2
-    uint256 constant EXPECT_NUT = 60e6;   // 20e6 * 3
+    address treasury = makeAddr("treasury");
+    address attacker = makeAddr("attacker");
+
+    bytes32 pipsUID_;
+    bytes32 lpUID_;
+
+    uint256 constant AMOUNT = 100e6;
+    uint256 constant MAX_RUN = 1_000_000e6;
+    uint256 constant HORIZON = 3600;
 
     function setUp() public {
-        usdc = new MockERC20("USD Coin", "USDC");
+        usdc = new MockUSDC();
         nut = new MockERC20("NUT", "NUT");
-        pips = new MockERC20("PIPS", "PIPS");
-        lpToken = new MockERC20("LP", "LP");
         wnut = new WNUT(address(nut));
+        pips = new MockERC20("PIPS", "PIPS");
+        registry = new MockSchemaRegistry();
+        eas = new MockEAS(address(registry));
         pipsBuyer = new MockPipsBuyer(address(usdc), address(pips));
         swapRouter = new MockSwapRouter(address(usdc), address(nut));
-        lpRouter = new MockLpRouter();
-        eas = new MockEAS();
-        registry = new MockSchemaRegistry();
-        registry.register(PIPS_SCHEMA);
-        registry.register(LP_SCHEMA);
+        pair = new MockPair(address(wnut), address(nut));
+        lpRouter = new MockLpRouter(pair);
 
-        router = new FeeRouter(
-            address(usdc),
-            address(nut),
-            address(wnut),
-            address(pips),
-            address(pipsBuyer),
-            address(swapRouter),
-            address(lpRouter),
-            address(eas),
-            address(registry),
-            address(lpToken),
-            PIPS_SCHEMA,
-            LP_SCHEMA,
-            0,          // admin delay (tests)
-            block.chainid
+        pipsUID_ = registry.register(PIPS_DEF, ISchemaResolver(address(0)), false);
+        lpUID_ = registry.register(LP_DEF, ISchemaResolver(address(0)), false);
+
+        router = _deploy(0);
+
+        usdc.mint(address(this), 1_000_000e6);
+        usdc.approve(address(router), type(uint256).max);
+    }
+
+    function _deploy(uint48 adminDelay) internal returns (FeeRouter) {
+        return new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips),
+            address(pipsBuyer), address(swapRouter), address(lpRouter),
+            address(eas), address(registry), address(pair),
+            pipsUID_, lpUID_, adminDelay, block.chainid, MAX_RUN, HORIZON
         );
-
-        vm.startPrank(address(this));
-        router.grantRole(router.OPERATOR_ROLE(), operator);
-        router.revokeRole(router.OPERATOR_ROLE(), address(this));
-        vm.stopPrank();
-        usdc.mint(operator, 1_000_000e6);
     }
 
-    function _bounds() internal view returns (uint256, uint256, uint256, uint256, uint256) {
-        return (EXPECT_PIPS, EXPECT_NUT, EXPECT_NUT / 2, EXPECT_NUT / 2, block.timestamp + 300);
+    function _run() internal returns (bytes32, bytes32) {
+        return router.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
     }
 
-    function _deploy(uint256 amount) internal returns (bytes32, bytes32) {
-        (uint256 minPips, uint256 minNut, uint256 minW, uint256 minN, uint256 dl) = _bounds();
-        vm.startPrank(operator);
-        usdc.approve(address(router), amount);
-        (bytes32 a, bytes32 b) = router.splitAndDeploy(amount, minPips, minNut, minW, minN, dl);
-        vm.stopPrank();
-        return (a, b);
+    function _runOn(FeeRouter fr) internal returns (bytes32, bytes32) {
+        usdc.approve(address(fr), type(uint256).max);
+        return fr.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
     }
 
     // ═══════════════ HAPPY PATH ═══════════════
 
     function test_SplitAndDeploy_HappyPath() public {
-        (bytes32 pipsUID, bytes32 lpUID) = _deploy(IN);
-        assertTrue(eas.exists(pipsUID));
-        assertTrue(eas.exists(lpUID));
-        assertEq(router.totalUsdcProcessed(), IN);
+        (bytes32 p, bytes32 l) = _run();
+        assertGt(uint256(p), 0);
+        assertGt(uint256(l), 0);
+
+        assertEq(router.totalUsdcProcessed(), 100e6);
         assertEq(router.totalUsdcToPips(), 80e6);
         assertEq(router.totalUsdcToLp(), 20e6);
-        assertEq(router.totalPipsMinted(), EXPECT_PIPS);
-        assertEq(router.totalLpAdded() > 0, true);
-        // PIPS delivered to router (protocol custody)
-        assertEq(pips.balanceOf(address(router)), EXPECT_PIPS);
+
+        assertEq(router.totalPipsMinted(), 160e18);
+        assertEq(router.totalLpAdded(), 9e26);
+        assertEq(pips.balanceOf(address(router)), 160e18);
+        assertEq(pair.balanceOf(address(router)), 9e26);
+
+        (uint256 u, uint256 w, uint256 n) = router.residuals();
+        assertEq(u, 0);
+        assertEq(w, 0);
+        assertEq(n, 0);
     }
 
-    // ═══════════════ H-01: SLIPPAGE BOUNDS ═══════════════
+    function test_TwoAttestationsPerRun() public {
+        (bytes32 p, bytes32 l) = _run();
+        assertEq(eas.attestCount(), 2);
+        assertTrue(eas.exists(p));
+        assertTrue(eas.exists(l));
+        assertNotEq(p, l);
+    }
+
+    // ═══════════════ SLIPPAGE / BOUNDS ═══════════════
 
     function test_SwapSlippage_RevertsWhenRateDrops() public {
-        swapRouter.setRate(2); // was 3 -> NUT out drops 1/3
-        vm.prank(operator);
-        usdc.approve(address(router), IN);
-        (uint256 minPips, uint256 minNut, uint256 minW, uint256 minN, uint256 dl) = _bounds();
-        vm.prank(operator);
+        swapRouter.setRate(1e12);
         vm.expectRevert(FeeRouter.InsufficientNut.selector);
-        router.splitAndDeploy(IN, minPips, minNut, minW, minN, dl);
+        _run();
     }
 
     function test_ZeroSlippageBound_Reverts() public {
-        vm.prank(operator);
-        usdc.approve(address(router), IN);
-        vm.prank(operator);
         vm.expectRevert(FeeRouter.ZeroSlippageBound.selector);
-        router.splitAndDeploy(IN, 0, EXPECT_NUT, EXPECT_NUT / 2, EXPECT_NUT / 2, block.timestamp + 300);
+        router.splitAndDeploy(AMOUNT, 0, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
     }
 
     function test_DeadlineExpired_Reverts() public {
-        vm.prank(operator);
-        usdc.approve(address(router), IN);
-        (, , , , uint256 dl) = _bounds();
-        vm.warp(dl + 1);
-        vm.prank(operator);
         vm.expectRevert(FeeRouter.DeadlineExpired.selector);
-        router.splitAndDeploy(IN, EXPECT_PIPS, EXPECT_NUT, EXPECT_NUT / 2, EXPECT_NUT / 2, dl);
+        router.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp - 1);
     }
 
-    // ═══════════════ H-02: LYING ADAPTER ═══════════════
+    function test_DeadlineTooFar_Reverts() public {
+        vm.expectRevert(FeeRouter.DeadlineTooFar.selector);
+        router.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + HORIZON + 1);
+    }
+
+    function test_AmountAboveCap_Reverts() public {
+        vm.expectRevert(FeeRouter.AmountTooLarge.selector);
+        router.splitAndDeploy(MAX_RUN + 1, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 60);
+    }
+
+    function test_ZeroAmount_Reverts() public {
+        vm.expectRevert(FeeRouter.ZeroAmount.selector);
+        router.splitAndDeploy(0, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 60);
+    }
+
+    // ═══════════════ ADVERSARIAL ADAPTERS ═══════════════
 
     function test_LyingPipsBuyer_Reverts() public {
         LyingPipsBuyer liar = new LyingPipsBuyer(address(usdc), address(pips));
-        // redeploy router with liar
-        FeeRouter r2 = new FeeRouter(
+        FeeRouter bad = new FeeRouter(
             address(usdc), address(nut), address(wnut), address(pips),
             address(liar), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(lpToken),
-            PIPS_SCHEMA, LP_SCHEMA, 0, block.chainid
+            address(eas), address(registry), address(pair),
+            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
         );
-        r2.grantRole(r2.OPERATOR_ROLE(), operator);
-        usdc.mint(operator, IN);
-        vm.startPrank(operator);
-        usdc.approve(address(r2), IN);
+        usdc.approve(address(bad), type(uint256).max);
         vm.expectRevert(FeeRouter.InsufficientPips.selector);
-        r2.splitAndDeploy(IN, EXPECT_PIPS, EXPECT_NUT, EXPECT_NUT / 2, EXPECT_NUT / 2, block.timestamp + 300);
-        vm.stopPrank();
+        bad.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
     }
 
-    // ═══════════════ H-03: PROTECTED TOKENS ═══════════════
+    function test_StingyPipsBuyer_AccountingMeasuresActualSpend() public {
+        StingyPipsBuyer stingy = new StingyPipsBuyer(address(usdc), address(pips));
+        FeeRouter fr = new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips),
+            address(stingy), address(swapRouter), address(lpRouter),
+            address(eas), address(registry), address(pair),
+            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+        );
+        usdc.approve(address(fr), type(uint256).max);
+        fr.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
 
-    function test_RecoverDust_BlocksAllProtectedTokens() public {
-        vm.expectRevert(FeeRouter.ProtectedToken.selector);
-        router.recoverDust(address(usdc), treasury);
-        vm.expectRevert(FeeRouter.ProtectedToken.selector);
-        router.recoverDust(address(nut), treasury);
-        vm.expectRevert(FeeRouter.ProtectedToken.selector);
-        router.recoverDust(address(wnut), treasury);
-        vm.expectRevert(FeeRouter.ProtectedToken.selector);
-        router.recoverDust(address(pips), treasury);
-        vm.expectRevert(FeeRouter.ProtectedToken.selector);
-        router.recoverDust(address(lpToken), treasury);
+        assertEq(fr.totalUsdcToPips(), 40e6, "must measure actual USDC consumed");
+        assertEq(fr.totalUsdcToLp(), 20e6);
+        assertEq(fr.totalUsdcProcessed(), 100e6);
+        (uint256 u, , ) = fr.residuals();
+        assertEq(u, 40e6);
     }
 
-    function test_RecoverDust_WorksWithJunk() public {
-        MockERC20 junk = new MockERC20("JUNK", "JUNK");
-        junk.mint(address(router), 5e18);
-        uint256 got = router.recoverDust(address(junk), treasury);
-        assertEq(got, 5e18);
-        assertEq(junk.balanceOf(treasury), 5e18);
+    function test_LyingSwapRouter_Reverts() public {
+        LyingSwapRouter liar = new LyingSwapRouter(address(usdc), address(nut));
+        FeeRouter bad = new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips),
+            address(pipsBuyer), address(liar), address(lpRouter),
+            address(eas), address(registry), address(pair),
+            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+        );
+        usdc.approve(address(bad), type(uint256).max);
+        vm.expectRevert(FeeRouter.InsufficientNut.selector);
+        bad.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
     }
 
-    function test_RescueUsdc_OnlyWhenPaused() public {
-        usdc.mint(address(router), 50e6);
-        vm.expectRevert(); // not paused
-        router.rescueUsdc(treasury);
-        router.pause();
-        uint256 got = router.rescueUsdc(treasury);
-        assertEq(got, 50e6);
-        assertEq(usdc.balanceOf(treasury), 50e6);
+    function test_LyingLpRouter_Reverts() public {
+        LyingLpRouter liar = new LyingLpRouter();
+        FeeRouter bad = new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips),
+            address(pipsBuyer), address(swapRouter), address(liar),
+            address(eas), address(registry), address(pair),
+            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+        );
+        usdc.approve(address(bad), type(uint256).max);
+        vm.expectRevert(FeeRouter.InsufficientLiquidity.selector);
+        bad.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
     }
 
-    function test_RecoverPips_PipsOnly() public {
-        _deploy(IN);
-        vm.expectRevert(); // attacker
+    function test_SparingLpRouter_ResidualsCarriedAndAccounted() public {
+        SparingLpRouter sparing = new SparingLpRouter(pair);
+        FeeRouter fr = new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips),
+            address(pipsBuyer), address(swapRouter), address(sparing),
+            address(eas), address(registry), address(pair),
+            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+        );
+        usdc.approve(address(fr), type(uint256).max);
+
+        vm.expectEmit(true, true, true, true, address(fr));
+        emit FeeRouter.ResidualsCarried(0, 3e18, 3e18);
+        fr.splitAndDeploy(AMOUNT, 150e18, 55e18, 26e18, 26e18, 7e26, block.timestamp + 1800);
+
+        assertEq(fr.totalLpAdded(), 7.29e26);
+        (uint256 u, uint256 w, uint256 n) = fr.residuals();
+        assertEq(u, 0);
+        assertEq(w, 3e18);
+        assertEq(n, 3e18);
+    }
+
+    // ═══════════════ ACCESS CONTROL ═══════════════
+
+    function test_OnlyOperator_CanCall() public {
         vm.prank(attacker);
-        router.recoverPips(treasury);
-        uint256 got = router.recoverPips(treasury);
-        assertEq(got, EXPECT_PIPS);
-        assertEq(pips.balanceOf(treasury), EXPECT_PIPS);
+        vm.expectRevert();
+        router.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
     }
 
-    // ═══════════════ M-02: SINGLE AUTHORITY ═══════════════
+    function test_Pause_Blocks() public {
+        router.pause();
+        vm.expectRevert();
+        _run();
+    }
 
     function test_AdminTransferIsTwoStepAndDelayed() public {
-        router.beginDefaultAdminTransfer(operator);
-        uint48 delay = router.defaultAdminDelay();
-        vm.warp(block.timestamp + delay + 1);
-        vm.prank(operator);
-        router.acceptDefaultAdminTransfer();
-        assertTrue(router.hasRole(router.DEFAULT_ADMIN_ROLE(), operator));
-        assertFalse(router.hasRole(router.DEFAULT_ADMIN_ROLE(), address(this)));
-    }
-        function test_FormerAdminLosesAllPower() public {
-        test_AdminTransferIsTwoStepAndDelayed();
-        // former admin (this) tries admin action -> revert
+        FeeRouter delayed = _deploy(3 days);
+        delayed.beginDefaultAdminTransfer(treasury);
+        vm.prank(treasury);
         vm.expectRevert();
-        router.setPipsBps(5000);
+        delayed.acceptDefaultAdminTransfer();
+        vm.warp(block.timestamp + 3 days + 2 seconds);
+        vm.prank(treasury);
+        delayed.acceptDefaultAdminTransfer();
+        assertTrue(delayed.hasRole(delayed.DEFAULT_ADMIN_ROLE(), treasury));
+        assertFalse(delayed.hasRole(delayed.DEFAULT_ADMIN_ROLE(), address(this)));
     }
 
-    // ═══════════════ M-03: CTOR VALIDATION ═══════════════
+    function test_FormerAdminLosesAllPower() public {
+        FeeRouter delayed = _deploy(3 days);
+        delayed.beginDefaultAdminTransfer(treasury);
+        vm.warp(block.timestamp + 3 days + 2 seconds);
+        vm.prank(treasury);
+        delayed.acceptDefaultAdminTransfer();
+        vm.expectRevert();
+        delayed.pause();
+    }
+
+    // ═══════════════ CONSTRUCTOR GUARDS ═══════════════
 
     function test_Ctor_RevertsOnZeroAddress() public {
         vm.expectRevert(FeeRouter.BadDependency.selector);
         new FeeRouter(
             address(0), address(nut), address(wnut), address(pips),
             address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(lpToken),
-            PIPS_SCHEMA, LP_SCHEMA, 0, block.chainid
+            address(eas), address(registry), address(pair),
+            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
         );
     }
 
@@ -225,118 +286,173 @@ contract FeeRouterTest is Test {
         new FeeRouter(
             address(usdc), address(nut), address(wnut), address(pips),
             address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(lpToken),
-            PIPS_SCHEMA, LP_SCHEMA, 0, block.chainid + 1
+            address(eas), address(registry), address(pair),
+            pipsUID_, lpUID_, 0, block.chainid + 1, MAX_RUN, HORIZON
         );
     }
 
-    function test_Ctor_RevertsOnUnknownSchema() public {
+    function test_Ctor_RevertsOnUnknownSchemaUID() public {
         vm.expectRevert(FeeRouter.SchemaNotFound.selector);
         new FeeRouter(
             address(usdc), address(nut), address(wnut), address(pips),
             address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(lpToken),
-            bytes32(uint256(1)), LP_SCHEMA, 0, block.chainid
+            address(eas), address(registry), address(pair),
+            bytes32(uint256(123)), lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+        );
+    }
+
+    function test_Ctor_RevertsOnWrongSchemaDefinition() public {
+        bytes32 wrongUID = registry.register("uint256 amount", ISchemaResolver(address(0)), false);
+        vm.expectRevert(FeeRouter.SchemaNotFound.selector);
+        new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips),
+            address(pipsBuyer), address(swapRouter), address(lpRouter),
+            address(eas), address(registry), address(pair),
+            wrongUID, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+        );
+    }
+
+    function test_Ctor_RevertsOnRegistryMismatch() public {
+        MockSchemaRegistry other = new MockSchemaRegistry();
+        vm.expectRevert();
+        new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips),
+            address(pipsBuyer), address(swapRouter), address(lpRouter),
+            address(eas), address(registry), address(other),
+            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
         );
     }
 
     function test_Ctor_RevertsOnWrongWnutUnderlying() public {
-        MockERC20 fakeNut = new MockERC20("FAKE", "FAKE");
+        MockERC20 fakeNut = new MockERC20("fake", "FK");
         WNUT fakeWnut = new WNUT(address(fakeNut));
         vm.expectRevert(FeeRouter.BadDependency.selector);
         new FeeRouter(
             address(usdc), address(nut), address(fakeWnut), address(pips),
             address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(lpToken),
-            PIPS_SCHEMA, LP_SCHEMA, 0, block.chainid
-        );
-        // sanity: correct pairing works
-        WNUT goodWnut = new WNUT(address(nut));
-        new FeeRouter(
-            address(usdc), address(nut), address(goodWnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(lpToken),
-            PIPS_SCHEMA, LP_SCHEMA, 0, block.chainid
+            address(eas), address(registry), address(pair),
+            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
         );
     }
 
-    // ═══════════════ M-01: ALLOWANCE HYGIENE ═══════════════
+    function test_Ctor_RevertsOnBadLpTokenPair() public {
+        MockPair wrongPair = new MockPair(address(nut), address(usdc));
+        vm.expectRevert(FeeRouter.BadLpToken.selector);
+        new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips),
+            address(pipsBuyer), address(swapRouter), address(lpRouter),
+            address(eas), address(registry), address(wrongPair),
+            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+        );
+    }
+
+    function test_Ctor_RevertsOnBadCaps() public {
+        vm.expectRevert(FeeRouter.BadCap.selector);
+        new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips),
+            address(pipsBuyer), address(swapRouter), address(lpRouter),
+            address(eas), address(registry), address(pair),
+            pipsUID_, lpUID_, 0, block.chainid, 0, HORIZON
+        );
+    }
+
+    // ═══════════════ RECOVERY / RESCUE ═══════════════
+
+    function test_RecoverDust_BlocksAllProtectedTokens() public {
+        _run();
+        address[5] memory protected = [
+            address(usdc), address(nut), address(wnut), address(pips), address(pair)
+        ];
+        for (uint256 i = 0; i < 5; i++) {
+            vm.expectRevert(FeeRouter.ProtectedToken.selector);
+            router.recoverDust(protected[i], treasury);
+        }
+    }
+
+    function test_RecoverDust_WorksWithJunk() public {
+        MockERC20 junk = new MockERC20("junk", "JNK");
+        junk.mint(address(router), 42e18);
+        uint256 got = router.recoverDust(address(junk), treasury);
+        assertEq(got, 42e18);
+        assertEq(junk.balanceOf(treasury), 42e18);
+    }
+
+    function test_RecoverPips_PipsOnly() public {
+        _run();
+        uint256 got = router.recoverPips(treasury);
+        assertEq(got, 160e18);
+        assertEq(pips.balanceOf(treasury), 160e18);
+        assertEq(pips.balanceOf(address(router)), 0);
+    }
+
+    function test_RescueUsdc_OnlyWhenPaused() public {
+        vm.expectRevert();
+        router.rescueUsdc(treasury);
+
+        router.pause();
+        usdc.mint(address(router), 7e6);
+        uint256 got = router.rescueUsdc(treasury);
+        assertEq(got, 7e6);
+    }
+
+    // ═══════════════ HYGIENE ═══════════════
 
     function test_AllowancesResetAfterRun() public {
-        _deploy(IN);
+        _run();
         assertEq(usdc.allowance(address(router), address(pipsBuyer)), 0);
         assertEq(usdc.allowance(address(router), address(swapRouter)), 0);
         assertEq(nut.allowance(address(router), address(wnut)), 0);
         assertEq(nut.allowance(address(router), address(lpRouter)), 0);
-        assertEq(IERC20(address(wnut)).allowance(address(router), address(lpRouter)), 0);
+        assertEq(wnut.allowance(address(router), address(lpRouter)), 0);
     }
 
     function test_SecondRunDoesNotSweepPreexistingBalances() public {
-        _deploy(IN);
-        // run 2: accounting must be exactly 2x, no pre-existing balance contamination
-        (bytes32 a, bytes32 b) = _deploy(IN);
-        assertTrue(eas.exists(a));
-        assertTrue(eas.exists(b));
-        assertEq(router.totalPipsMinted(), EXPECT_PIPS * 2);
-        assertEq(router.totalUsdcProcessed(), IN * 2);
+        _run();
+        pips.mint(address(router), 1_000e18);
+        nut.mint(address(router), 1_000e18);
+        usdc.mint(address(router), 500e6);
+
+        _run();
+
+        assertEq(router.totalPipsMinted(), 2 * 160e18);
+        assertEq(router.totalLpAdded(), 2 * 9e26);
+        assertEq(router.totalUsdcProcessed(), 2 * 100e6);
+
+        assertEq(pips.balanceOf(address(router)), 1_000e18 + 320e18);
+        (, , uint256 n) = router.residuals();
+        assertEq(n, 1_000e18);
+        (uint256 u, , ) = router.residuals();
+        assertEq(u, 500e6);
     }
 
-    // ═══════════════ RBAC ═══════════════
-
-    function test_OnlyOperator_CanCall() public {
-        usdc.mint(attacker, IN);
-        vm.startPrank(attacker);
-        usdc.approve(address(router), IN);
-        vm.expectRevert();
-        (uint256 minPips, uint256 minNut, uint256 minW, uint256 minN, uint256 dl) = _bounds();
-        router.splitAndDeploy(IN, minPips, minNut, minW, minN, dl);
-        vm.stopPrank();
-    }
-
-    function test_ZeroAmount_Reverts() public {
-        vm.prank(operator);
-        vm.expectRevert(FeeRouter.ZeroAmount.selector);
-        router.splitAndDeploy(0, 1, 1, 1, 1, block.timestamp + 300);
-    }
-
-    function test_Pause_Blocks() public {
-        router.pause();
-        vm.startPrank(operator);
-        usdc.approve(address(router), IN);
-        vm.expectRevert();
-        (uint256 minPips, uint256 minNut, uint256 minW, uint256 minN, uint256 dl) = _bounds();
-        router.splitAndDeploy(IN, minPips, minNut, minW, minN, dl);
-        vm.stopPrank();
-    }
-
-    // ═══════════════ ADMIN ═══════════════
+    // ═══════════════ ADMIN SETTERS ═══════════════
 
     function test_SetPipsBps() public {
         router.setPipsBps(5000);
         assertEq(router.pipsBps(), 5000);
+        vm.expectRevert(FeeRouter.BadSplit.selector);
+        router.setPipsBps(10_000);
     }
 
-    function test_SetPipsBps_RevertsBadValue() public {
-        vm.expectRevert(FeeRouter.BadSplit.selector);
-        router.setPipsBps(0);
+    function test_SetCaps() public {
+        router.setCaps(50e6, 60);
+        assertEq(router.maxUsdcPerRun(), 50e6);
+        assertEq(router.maxDeadlineHorizon(), 60);
     }
 
     function test_SetSchemaUIDs_RejectsUnknown() public {
         vm.expectRevert(FeeRouter.SchemaNotFound.selector);
-        router.setSchemaUIDs(bytes32(uint256(99)), LP_SCHEMA);
+        router.setSchemaUIDs(bytes32(uint256(999)), lpUID_);
+    }
+
+    function test_SetSchemaUIDs_RejectsWrongDefinition() public {
+        bytes32 wrongUID = registry.register("uint256 x", ISchemaResolver(address(0)), false);
+        vm.expectRevert(FeeRouter.SchemaNotFound.selector);
+        router.setSchemaUIDs(wrongUID, lpUID_);
     }
 
     function test_SetSchemaUIDs_AcceptsKnown() public {
-        bytes32 newPips = keccak256("NEW_PIPS");
-        registry.register(newPips);
-        router.setSchemaUIDs(newPips, LP_SCHEMA);
-        assertEq(router.pipsSchemaUID(), newPips);
-    }
-
-    // ═══════════════ ATTESTATIONS ═══════════════
-
-    function test_TwoAttestationsPerRun() public {
-        _deploy(IN);
-        assertEq(eas.attestCount(), 2);
+        router.setSchemaUIDs(pipsUID_, lpUID_);
+        assertEq(router.pipsSchemaUID(), pipsUID_);
     }
 }
