@@ -72,7 +72,7 @@ contract AerodromeAdapter is ISwapRouter, IAddLiquidityRouter {
 
     IAerodromeRouter public immutable aerodrome;
     address public immutable aeroFactory;
-    address public immutable boundPool;   // canonical volatile pool for the bound pair
+    address public immutable boundPool; // canonical volatile pool for the bound pair
     address public immutable boundTokenA;
     address public immutable boundTokenB;
 
@@ -81,21 +81,14 @@ contract AerodromeAdapter is ISwapRouter, IAddLiquidityRouter {
     error PairNotBound();
     error BadPair();
 
-    constructor(
-        address aerodrome_,
-        address aeroFactory_,
-        address lpToken_,
-        address tokenA_,
-        address tokenB_
-    ) {
+    constructor(address aerodrome_, address aeroFactory_, address lpToken_, address tokenA_, address tokenB_) {
         if (
-            aerodrome_ == address(0) || aeroFactory_ == address(0) || lpToken_ == address(0)
-                || tokenA_ == address(0) || tokenB_ == address(0) || tokenA_ == tokenB_
+            aerodrome_ == address(0) || aeroFactory_ == address(0) || lpToken_ == address(0) || tokenA_ == address(0)
+                || tokenB_ == address(0) || tokenA_ == tokenB_
         ) revert BadPair();
-        if (
-            aerodrome_.code.length == 0 || aeroFactory_.code.length == 0
-                || lpToken_.code.length == 0
-        ) revert BadPair();
+        if (aerodrome_.code.length == 0 || aeroFactory_.code.length == 0 || lpToken_.code.length == 0) {
+            revert BadPair();
+        }
 
         // Swap routes and addLiquidity must target the same factory's pools.
         if (IAerodromeRouter(aerodrome_).defaultFactory() != aeroFactory_) revert FactoryMismatch();
@@ -128,12 +121,7 @@ contract AerodromeAdapter is ISwapRouter, IAddLiquidityRouter {
         input.safeTransferFrom(msg.sender, address(this), amountIn);
 
         IAerodromeRouter.Route[] memory routes = new IAerodromeRouter.Route[](1);
-        routes[0] = IAerodromeRouter.Route({
-            from: path[0],
-            to: path[1],
-            stable: false,
-            factory: aeroFactory
-        });
+        routes[0] = IAerodromeRouter.Route({from: path[0], to: path[1], stable: false, factory: aeroFactory});
 
         input.forceApprove(address(aerodrome), amountIn);
         amounts = aerodrome.swapExactTokensForTokens(amountIn, amountOutMin, routes, to, deadline);
@@ -154,10 +142,7 @@ contract AerodromeAdapter is ISwapRouter, IAddLiquidityRouter {
         address to,
         uint256 deadline
     ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity) {
-        if (
-            !((tokenA == boundTokenA && tokenB == boundTokenB)
-                || (tokenA == boundTokenB && tokenB == boundTokenA))
-        ) revert PairNotBound();
+        if (!((tokenA == boundTokenA && tokenB == boundTokenB) || (tokenA == boundTokenB && tokenB == boundTokenA))) revert PairNotBound();
 
         IERC20 a = IERC20(tokenA);
         IERC20 b = IERC20(tokenB);

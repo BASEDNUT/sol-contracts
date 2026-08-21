@@ -13,6 +13,9 @@ import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
  * @notice 1:1 ERC-20 wrapper over NUT (18 decimals). Custodies NUT, reissues wNUT.
  *         Immutable. No governance, no pausing, no upgradeability.
  *         Direct NUT transfers do NOT mint wNUT — owner-only recoverSurplus() handles surplus.
+ *         Underlying MUST be 18-decimal (I-01): share accounting is 1:1 raw-unit and
+ *         breaks silently against non-18dp tokens. Fee-on-transfer/deflationary
+ *         underlyings are out of scope by design (NUT is pure ERC-20, no tax).
  */
 contract WNUT is ERC20Wrapper, Ownable2Step {
     using SafeERC20 for IERC20;
@@ -22,13 +25,10 @@ contract WNUT is ERC20Wrapper, Ownable2Step {
     event Recovered(address indexed token, address indexed to, uint256 amount);
     event SurplusRecovered(address indexed to, uint256 amount);
 
-    constructor(address nut_)
-        ERC20("Wrapped NUT", "wNUT")
-        ERC20Wrapper(IERC20(nut_))
-        Ownable(msg.sender)
-    {
+    constructor(address nut_) ERC20("Wrapped NUT", "wNUT") ERC20Wrapper(IERC20(nut_)) Ownable(msg.sender) {
         require(nut_ != address(0), "WNUT: zero NUT");
         require(nut_.code.length > 0, "WNUT: NUT not a contract");
+        require(ERC20(nut_).decimals() == 18, "WNUT: NUT decimals != 18");
         nut = IERC20(nut_);
     }
 

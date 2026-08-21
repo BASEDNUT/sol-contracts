@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {WNUT} from "../../src/wnut/WNUT.sol";
-import {MockERC20} from "../mocks/Mocks.sol";
+import {MockERC20, SixDecimalToken} from "../mocks/Mocks.sol";
 
 contract WNUTTest is Test {
     WNUT public wnut;
@@ -27,6 +27,14 @@ contract WNUTTest is Test {
     }
 
     // ── Constructor validation ──
+
+    /// @dev I-01: non-18dp underlying breaks 1:1 raw-unit accounting — reject.
+    function test_Ctor_RevertsOnNon18Decimals() public {
+        SixDecimalToken six = new SixDecimalToken();
+        vm.expectRevert(bytes("WNUT: NUT decimals != 18"));
+        new WNUT(address(six));
+    }
+
     function test_Ctor_RevertsOnZeroNUT() public {
         vm.expectRevert();
         new WNUT(address(0));

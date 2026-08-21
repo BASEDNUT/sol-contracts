@@ -47,16 +47,38 @@ contract MockAerodrome {
         defaultFactory = factory_;
     }
 
-    function lastLp() external view returns (
-        address tokenA, address tokenB, bool stable,
-        uint256 desiredA, uint256 desiredB, uint256 minA, uint256 minB, address to
-    ) {
-        return (_lastLp.tokenA, _lastLp.tokenB, _lastLp.stable, _lastLp.desiredA, _lastLp.desiredB, _lastLp.minA, _lastLp.minB, _lastLp.to);
+    function lastLp()
+        external
+        view
+        returns (
+            address tokenA,
+            address tokenB,
+            bool stable,
+            uint256 desiredA,
+            uint256 desiredB,
+            uint256 minA,
+            uint256 minB,
+            address to
+        )
+    {
+        return (
+            _lastLp.tokenA,
+            _lastLp.tokenB,
+            _lastLp.stable,
+            _lastLp.desiredA,
+            _lastLp.desiredB,
+            _lastLp.minA,
+            _lastLp.minB,
+            _lastLp.to
+        );
     }
 
     function swapExactTokensForTokens(
-        uint256 amountIn, uint256 amountOutMin,
-        IAerodromeRouter.Route[] calldata routes, address to, uint256 deadline
+        uint256 amountIn,
+        uint256 amountOutMin,
+        IAerodromeRouter.Route[] calldata routes,
+        address to,
+        uint256 deadline
     ) external returns (uint256[] memory amounts) {
         require(routes.length == 1, "MOCK: single route");
         MockERC20(routes[0].from).transferFrom(msg.sender, address(this), amountIn);
@@ -64,14 +86,20 @@ contract MockAerodrome {
         amounts = new uint256[](2);
         amounts[0] = amountIn;
         amounts[1] = amountIn * 2;
-        amountOutMin; deadline;
+        amountOutMin;
+        deadline;
     }
 
     function addLiquidity(
-        address tokenA, address tokenB, bool stable,
-        uint256 amountADesired, uint256 amountBDesired,
-        uint256 amountAMin, uint256 amountBMin,
-        address to, uint256
+        address tokenA,
+        address tokenB,
+        bool stable,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256
     ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity) {
         // Consumes only 95% of desired — real AMM ratio behavior leaves residuals.
         amountA = (amountADesired * 95) / 100;
@@ -102,9 +130,7 @@ contract AerodromeAdapterTest is Test {
         // Canonical volatile pool for USDC/NUT lives at lpToken.
         factory.setPool(address(usdc), address(nut), false, address(lpToken));
 
-        adapter = new AerodromeAdapter(
-            address(aero), address(factory), address(lpToken), address(usdc), address(nut)
-        );
+        adapter = new AerodromeAdapter(address(aero), address(factory), address(lpToken), address(usdc), address(nut));
 
         usdc.mint(address(this), 1_000e6);
         nut.mint(address(this), 1_000e18);
@@ -118,9 +144,8 @@ contract AerodromeAdapterTest is Test {
     ///      reorders arguments (e.g. moves `stable`), the selector changes and
     ///      this test fails. Canonical: (address,address,bool,uint256,uint256,uint256,uint256,address,uint256).
     function test_AbiLock_AddLiquidityCanonicalSelector() public pure {
-        bytes4 expected = bytes4(
-            keccak256("addLiquidity(address,address,bool,uint256,uint256,uint256,uint256,address,uint256)")
-        );
+        bytes4 expected =
+            bytes4(keccak256("addLiquidity(address,address,bool,uint256,uint256,uint256,uint256,address,uint256)"));
         assertEq(IAerodromeRouter.addLiquidity.selector, expected);
     }
 
@@ -140,9 +165,7 @@ contract AerodromeAdapterTest is Test {
         wrongFactory.setPool(address(usdc), address(nut), false, address(lpToken));
         MockAerodrome wrongAero = new MockAerodrome(address(usdc), address(nut), address(wrongFactory));
         vm.expectRevert(AerodromeAdapter.FactoryMismatch.selector);
-        new AerodromeAdapter(
-            address(wrongAero), address(factory), address(lpToken), address(usdc), address(nut)
-        );
+        new AerodromeAdapter(address(wrongAero), address(factory), address(lpToken), address(usdc), address(nut));
     }
 
     function test_Ctor_RejectsNonCanonicalPool() public {
@@ -150,9 +173,7 @@ contract AerodromeAdapterTest is Test {
         // Factory says the real pool is the impostor, constructor binds lpToken.
         factory.setPool(address(usdc), address(nut), false, address(impostor));
         vm.expectRevert(AerodromeAdapter.NotCanonicalPool.selector);
-        new AerodromeAdapter(
-            address(aero), address(factory), address(lpToken), address(usdc), address(nut)
-        );
+        new AerodromeAdapter(address(aero), address(factory), address(lpToken), address(usdc), address(nut));
     }
 
     function test_Ctor_RejectsZeroAddress() public {
@@ -168,9 +189,8 @@ contract AerodromeAdapterTest is Test {
         path[1] = address(nut);
 
         uint256 nutBefore = nut.balanceOf(address(this));
-        uint256[] memory amounts = adapter.swapExactTokensForTokens(
-            10e6, 15e6, path, address(this), block.timestamp + 60
-        );
+        uint256[] memory amounts =
+            adapter.swapExactTokensForTokens(10e6, 15e6, path, address(this), block.timestamp + 60);
 
         // Route shape is not directly observable post-hoc; output proves execution.
         // setUp pre-mints NUT — assert via DELTA.
@@ -215,7 +235,7 @@ contract AerodromeAdapterTest is Test {
         );
 
         // Mock (canonical ABI) received the call and recorded arguments.
-        (address tA, address tB, bool stable, uint256 dA, uint256 dB, , , address lpTo) = aero.lastLp();
+        (address tA, address tB, bool stable, uint256 dA, uint256 dB,,, address lpTo) = aero.lastLp();
         assertEq(tA, address(usdc));
         assertEq(tB, address(nut));
         assertFalse(stable, "wNUT/NUT must be volatile");
@@ -240,9 +260,7 @@ contract AerodromeAdapterTest is Test {
         // Donate 50 NUT directly to the adapter.
         nut.transfer(address(adapter), 50e18);
 
-        adapter.addLiquidity(
-            address(usdc), address(nut), 10e6, 30e18, 1, 1, address(this), block.timestamp + 60
-        );
+        adapter.addLiquidity(address(usdc), address(nut), 10e6, 30e18, 1, 1, address(this), block.timestamp + 60);
 
         // Donation intact: 50e18 + nothing stranded. Mock consumed 95% of the
         // pulled 30e18, refunded 1.5e18 to the caller — the donation never moved.
@@ -256,8 +274,6 @@ contract AerodromeAdapterTest is Test {
         junk.mint(address(this), 100e18);
         junk.approve(address(adapter), type(uint256).max);
         vm.expectRevert(AerodromeAdapter.PairNotBound.selector);
-        adapter.addLiquidity(
-            address(junk), address(nut), 10e18, 10e18, 1, 1, address(this), block.timestamp + 60
-        );
+        adapter.addLiquidity(address(junk), address(nut), 10e18, 10e18, 1, 1, address(this), block.timestamp + 60);
     }
 }

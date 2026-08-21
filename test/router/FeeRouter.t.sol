@@ -50,6 +50,7 @@ contract FeeRouterTest is Test {
     uint256 constant AMOUNT = 100e6;
     uint256 constant MAX_RUN = 1_000_000e6;
     uint256 constant HORIZON = 3600;
+    uint256 constant MAX_WINDOW = 3_000_000e6;
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -74,15 +75,51 @@ contract FeeRouterTest is Test {
 
     function _deploy(uint48 adminDelay) internal returns (FeeRouter) {
         return new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(pair),
-            pipsUID_, lpUID_, adminDelay, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            adminDelay,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
     }
 
     function _run() internal returns (bytes32, bytes32) {
         return router.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
+    }
+
+    /// @dev M-02: dedicated router with window cap = 3 runs exactly.
+    function _deployTightWindow() internal returns (FeeRouter) {
+        return new FeeRouter(
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            AMOUNT,
+            HORIZON,
+            3 * AMOUNT
+        );
     }
 
     function _runOn(FeeRouter fr) internal returns (bytes32, bytes32) {
@@ -158,10 +195,23 @@ contract FeeRouterTest is Test {
     function test_LyingPipsBuyer_Reverts() public {
         LyingPipsBuyer liar = new LyingPipsBuyer(address(usdc), address(pips));
         FeeRouter bad = new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(liar), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(pair),
-            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(liar),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
         usdc.approve(address(bad), type(uint256).max);
         vm.expectRevert(FeeRouter.InsufficientPips.selector);
@@ -171,10 +221,23 @@ contract FeeRouterTest is Test {
     function test_StingyPipsBuyer_AccountingMeasuresActualSpend() public {
         StingyPipsBuyer stingy = new StingyPipsBuyer(address(usdc), address(pips));
         FeeRouter fr = new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(stingy), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(pair),
-            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(stingy),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
         usdc.approve(address(fr), type(uint256).max);
         fr.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
@@ -182,17 +245,30 @@ contract FeeRouterTest is Test {
         assertEq(fr.totalUsdcToPips(), 40e6, "must measure actual USDC consumed");
         assertEq(fr.totalUsdcToLp(), 20e6);
         assertEq(fr.totalUsdcProcessed(), 100e6);
-        (uint256 u, , ) = fr.residuals();
+        (uint256 u,,) = fr.residuals();
         assertEq(u, 40e6);
     }
 
     function test_LyingSwapRouter_Reverts() public {
         LyingSwapRouter liar = new LyingSwapRouter(address(usdc), address(nut));
         FeeRouter bad = new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(liar), address(lpRouter),
-            address(eas), address(registry), address(pair),
-            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(liar),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
         usdc.approve(address(bad), type(uint256).max);
         vm.expectRevert(FeeRouter.InsufficientNut.selector);
@@ -202,10 +278,23 @@ contract FeeRouterTest is Test {
     function test_LyingLpRouter_Reverts() public {
         LyingLpRouter liar = new LyingLpRouter();
         FeeRouter bad = new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(liar),
-            address(eas), address(registry), address(pair),
-            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(liar),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
         usdc.approve(address(bad), type(uint256).max);
         vm.expectRevert(FeeRouter.InsufficientLiquidity.selector);
@@ -215,10 +304,23 @@ contract FeeRouterTest is Test {
     function test_SparingLpRouter_ResidualsCarriedAndAccounted() public {
         SparingLpRouter sparing = new SparingLpRouter(pair);
         FeeRouter fr = new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(sparing),
-            address(eas), address(registry), address(pair),
-            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(sparing),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
         usdc.approve(address(fr), type(uint256).max);
 
@@ -318,10 +420,23 @@ contract FeeRouterTest is Test {
         bytes32 resolverUID = registry.register(PIPS_DEF, ISchemaResolver(address(resolver)), false);
         vm.expectRevert(FeeRouter.SchemaNotFound.selector);
         new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(pair),
-            resolverUID, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            resolverUID,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
     }
 
@@ -330,10 +445,23 @@ contract FeeRouterTest is Test {
         bytes32 revocableUID = registry.register(PIPS_DEF, ISchemaResolver(address(0)), true);
         vm.expectRevert(FeeRouter.SchemaNotFound.selector);
         new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(pair),
-            revocableUID, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            revocableUID,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
     }
 
@@ -412,30 +540,69 @@ contract FeeRouterTest is Test {
     function test_Ctor_RevertsOnZeroAddress() public {
         vm.expectRevert(FeeRouter.BadDependency.selector);
         new FeeRouter(
-            address(0), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(pair),
-            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(0),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
     }
 
     function test_Ctor_RevertsOnChainMismatch() public {
         vm.expectRevert(FeeRouter.ChainMismatch.selector);
         new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(pair),
-            pipsUID_, lpUID_, 0, block.chainid + 1, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid + 1,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
     }
 
     function test_Ctor_RevertsOnUnknownSchemaUID() public {
         vm.expectRevert(FeeRouter.SchemaNotFound.selector);
         new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(pair),
-            bytes32(uint256(123)), lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            bytes32(uint256(123)),
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
     }
 
@@ -443,10 +610,23 @@ contract FeeRouterTest is Test {
         bytes32 wrongUID = registry.register("uint256 amount", ISchemaResolver(address(0)), false);
         vm.expectRevert(FeeRouter.SchemaNotFound.selector);
         new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(pair),
-            wrongUID, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            wrongUID,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
     }
 
@@ -454,10 +634,23 @@ contract FeeRouterTest is Test {
         MockSchemaRegistry other = new MockSchemaRegistry();
         vm.expectRevert();
         new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(other),
-            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(other),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
     }
 
@@ -466,10 +659,23 @@ contract FeeRouterTest is Test {
         WNUT fakeWnut = new WNUT(address(fakeNut));
         vm.expectRevert(FeeRouter.BadDependency.selector);
         new FeeRouter(
-            address(usdc), address(nut), address(fakeWnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(pair),
-            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(fakeWnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
     }
 
@@ -477,20 +683,46 @@ contract FeeRouterTest is Test {
         MockPair wrongPair = new MockPair(address(nut), address(usdc));
         vm.expectRevert(FeeRouter.BadLpToken.selector);
         new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(wrongPair),
-            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(wrongPair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
     }
 
     function test_Ctor_RevertsOnBadCaps() public {
         vm.expectRevert(FeeRouter.BadCap.selector);
         new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips),
-            address(pipsBuyer), address(swapRouter), address(lpRouter),
-            address(eas), address(registry), address(pair),
-            pipsUID_, lpUID_, 0, block.chainid, 0, HORIZON
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            0,
+            HORIZON,
+            MAX_WINDOW
         );
     }
 
@@ -498,9 +730,7 @@ contract FeeRouterTest is Test {
 
     function test_RecoverDust_BlocksAllProtectedTokens() public {
         _run();
-        address[5] memory protected = [
-            address(usdc), address(nut), address(wnut), address(pips), address(pair)
-        ];
+        address[5] memory protected = [address(usdc), address(nut), address(wnut), address(pips), address(pair)];
         for (uint256 i = 0; i < 5; i++) {
             vm.expectRevert(FeeRouter.ProtectedToken.selector);
             router.recoverDust(protected[i], treasury);
@@ -557,9 +787,9 @@ contract FeeRouterTest is Test {
         assertEq(router.totalUsdcProcessed(), 2 * 100e6);
 
         assertEq(pips.balanceOf(address(router)), 1_000e18 + 320e18);
-        (, , uint256 n) = router.residuals();
+        (,, uint256 n) = router.residuals();
         assertEq(n, 1_000e18);
-        (uint256 u, , ) = router.residuals();
+        (uint256 u,,) = router.residuals();
         assertEq(u, 500e6);
     }
 
@@ -573,9 +803,16 @@ contract FeeRouterTest is Test {
     }
 
     function test_SetCaps() public {
-        router.setCaps(50e6, 60);
+        router.setCaps(50e6, 60, 500e6);
         assertEq(router.maxUsdcPerRun(), 50e6);
         assertEq(router.maxDeadlineHorizon(), 60);
+        assertEq(router.maxUsdcPerWindow(), 500e6);
+    }
+
+    /// @dev M-02: window cap may never fall below per-run cap.
+    function test_SetCaps_RevertsOnWindowBelowRun() public {
+        vm.expectRevert(FeeRouter.BadWindow.selector);
+        router.setCaps(50e6, 60, 49e6);
     }
 
     function test_SetSchemaUIDs_RejectsUnknown() public {
@@ -592,5 +829,129 @@ contract FeeRouterTest is Test {
     function test_SetSchemaUIDs_AcceptsKnown() public {
         router.setSchemaUIDs(pipsUID_, lpUID_);
         assertEq(router.pipsSchemaUID(), pipsUID_);
+    }
+
+    // ═══════════════ AUDIT ROUND 4 ═══════════════
+
+    /// @dev M-01: default-admin renunciation must be impossible — this
+    ///      contract has no shutdown mode; renounce would brick governance
+    ///      while leaving OPERATOR_ROLE holders in place.
+    function test_RenounceDefaultAdmin_Forbidden() public {
+        // Cache getter BEFORE expectRevert — a staticcall between expectRevert
+        // and the target call consumes the revert expectation.
+        bytes32 adminRole = router.DEFAULT_ADMIN_ROLE();
+        vm.expectRevert(FeeRouter.AdminRenunciationForbidden.selector);
+        router.renounceRole(adminRole, address(this));
+    }
+
+    /// @dev M-01: operator may still renounce its own operator role.
+    function test_RenounceOperatorRole_Allowed() public {
+        router.renounceRole(router.OPERATOR_ROLE(), address(this));
+        assertFalse(router.hasRole(router.OPERATOR_ROLE(), address(this)));
+    }
+
+    /// @dev M-02: rolling 24h window caps aggregate operator throughput.
+    function test_WindowCap_BlocksAggregate() public {
+        FeeRouter fr = _deployTightWindow();
+        // Window cap 3x AMOUNT: three runs pass, fourth reverts.
+        _runOn(fr);
+        _runOn(fr);
+        _runOn(fr);
+        // Direct call: _runOn's approve() would consume the expectRevert.
+        vm.expectRevert(FeeRouter.WindowCapExceeded.selector);
+        fr.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
+    }
+
+    /// @dev M-02: window resets after WINDOW_DURATION.
+    function test_WindowCap_ResetsAfterWindow() public {
+        FeeRouter fr = _deployTightWindow();
+        _runOn(fr);
+        _runOn(fr);
+        _runOn(fr);
+        vm.warp(block.timestamp + fr.WINDOW_DURATION() + 1);
+        _runOn(fr); // fresh window — succeeds
+        assertEq(fr.totalUsdcProcessed(), 4 * AMOUNT);
+    }
+
+    /// @dev M-02: fresh window does NOT inherit old spend.
+    function test_WindowCap_FreshWindowStartsClean() public {
+        FeeRouter fr = _deployTightWindow();
+        _runOn(fr);
+        _runOn(fr);
+        _runOn(fr);
+        vm.warp(block.timestamp + fr.WINDOW_DURATION() + 1);
+        _runOn(fr);
+        _runOn(fr);
+        _runOn(fr);
+        vm.expectRevert(FeeRouter.WindowCapExceeded.selector);
+        fr.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
+    }
+
+    /// @dev M-02: constructor rejects window < per-run cap.
+    function test_Ctor_RevertsOnWindowBelowRun() public {
+        vm.expectRevert(FeeRouter.BadWindow.selector);
+        new FeeRouter(
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_RUN - 1
+        );
+    }
+
+    /// @dev L-02: ResidualsDeployed must report ACTUAL consumed deltas,
+    ///      not requested amounts (SparingLpRouter consumes 90%).
+    function test_DeployResiduals_EmitsActualDeltas() public {
+        SparingLpRouter sparing = new SparingLpRouter(pair);
+        FeeRouter fr = new FeeRouter(
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(sparing),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
+        );
+        nut.mint(address(this), 30e18);
+        nut.approve(address(wnut), 30e18);
+        wnut.depositFor(address(fr), 30e18);
+        nut.mint(address(fr), 30e18);
+
+        vm.expectEmit(true, true, true, true, address(fr));
+        emit FeeRouter.ResidualsDeployed(27e18, 27e18, 7.29e26, block.timestamp);
+        fr.deployResiduals(26e18, 26e18, 700e24, block.timestamp + 1800);
+    }
+
+    /// @dev L-03: recovery destinations may never be address(0).
+    function test_Recovery_RevertsOnZeroRecipient() public {
+        vm.expectRevert(FeeRouter.ZeroRecipient.selector);
+        router.recoverPips(address(0));
+        vm.expectRevert(FeeRouter.ZeroRecipient.selector);
+        router.recoverDust(address(pips), address(0));
+        router.pause();
+        vm.expectRevert(FeeRouter.ZeroRecipient.selector);
+        router.rescueUsdc(address(0));
     }
 }
