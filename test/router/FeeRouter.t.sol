@@ -19,7 +19,8 @@ import {
     LyingSwapRouter,
     MockLpRouter,
     SparingLpRouter,
-    LyingLpRouter
+    LyingLpRouter,
+    MockResolver
 } from "../mocks/Mocks.sol";
 
 contract FeeRouterTest is Test {
@@ -267,6 +268,143 @@ contract FeeRouterTest is Test {
         delayed.acceptDefaultAdminTransfer();
         vm.expectRevert();
         delayed.pause();
+    }
+
+    /// @dev M-04: operator lifecycle — admin handoff must strip OPERATOR_ROLE too.
+    function test_FormerAdminLosesOperatorRole() public {
+        FeeRouter delayed = _deploy(3 days);
+        // Deployer is admin + operator.
+        assertTrue(delayed.hasRole(delayed.OPERATOR_ROLE(), address(this)));
+        assertTrue(delayed.hasRole(delayed.DEFAULT_ADMIN_ROLE(), address(this)));
+
+        delayed.beginDefaultAdminTransfer(treasury);
+        vm.warp(block.timestamp + 3 days + 2 seconds);
+        vm.prank(treasury);
+        delayed.acceptDefaultAdminTransfer();
+
+        // New admin has admin only — must grant operators explicitly.
+        assertTrue(delayed.hasRole(delayed.DEFAULT_ADMIN_ROLE(), treasury));
+        assertFalse(delayed.hasRole(delayed.OPERATOR_ROLE(), treasury));
+        // Former admin lost EVERYTHING — admin and operator.
+        assertFalse(delayed.hasRole(delayed.DEFAULT_ADMIN_ROLE(), address(this)));
+        assertFalse(delayed.hasRole(delayed.OPERATOR_ROLE(), address(this)));
+
+        // Former admin can no longer execute.
+        usdc.approve(address(delayed), type(uint256).max);
+        vm.expectRevert();
+        delayed.splitAndDeploy(AMOUNT, 150e18, 55e18, 29e18, 29e18, 8e26, block.timestamp + 1800);
+
+        // New admin can grant a fresh operator. NOTE: cache the role hash first —
+        // evaluating delayed.OPERATOR_ROLE() inside the prank would consume it.
+        bytes32 opRole = delayed.OPERATOR_ROLE();
+        vm.prank(treasury);
+        delayed.grantRole(opRole, attacker);
+        assertTrue(delayed.hasRole(opRole, attacker));
+    }
+
+    /// @dev M-04 edge: revoking operator works independently of admin.
+    function test_AdminCanRevokeOperator() public {
+        router.grantRole(router.OPERATOR_ROLE(), attacker);
+        assertTrue(router.hasRole(router.OPERATOR_ROLE(), attacker));
+        router.revokeRole(router.OPERATOR_ROLE(), attacker);
+        assertFalse(router.hasRole(router.OPERATOR_ROLE(), attacker));
+    }
+
+    // ═══════════════ SCHEMA SEMANTICS (L-01) ═══════════════
+
+    /// @dev Resolver-bearing schema must not satisfy the protocol invariant.
+    function test_Ctor_RejectsResolverBearingSchema() public {
+        MockResolver resolver = new MockResolver();
+        bytes32 resolverUID = registry.register(PIPS_DEF, ISchemaResolver(address(resolver)), false);
+        vm.expectRevert(FeeRouter.SchemaNotFound.selector);
+        new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips),
+            address(pipsBuyer), address(swapRouter), address(lpRouter),
+            address(eas), address(registry), address(pair),
+            resolverUID, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+        );
+    }
+
+    /// @dev Revocable schema must not satisfy the protocol invariant.
+    function test_Ctor_RejectsRevocableSchema() public {
+        bytes32 revocableUID = registry.register(PIPS_DEF, ISchemaResolver(address(0)), true);
+        vm.expectRevert(FeeRouter.SchemaNotFound.selector);
+        new FeeRouter(
+            address(usdc), address(nut), address(wnut), address(pips),
+            address(pipsBuyer), address(swapRouter), address(lpRouter),
+            address(eas), address(registry), address(pair),
+            revocableUID, lpUID_, 0, block.chainid, MAX_RUN, HORIZON
+        );
+    }
+
+    /// @dev setSchemaUIDs must also reject resolver/revocable schemas.
+    function test_SetSchemaUIDs_RejectsResolverBearing() public {
+        MockResolver resolver = new MockResolver();
+        bytes32 resolverUID = registry.register(PIPS_DEF, ISchemaResolver(address(resolver)), false);
+        vm.expectRevert(FeeRouter.SchemaNotFound.selector);
+        router.setSchemaUIDs(resolverUID, lpUID_);
+    }
+
+    /// @dev setSchemaUIDs must also reject revocable schemas.
+    function test_SetSchemaUIDs_RejectsRevocable() public {
+        bytes32 revocableUID = registry.register(PIPS_DEF, ISchemaResolver(address(0)), true);
+        vm.expectRevert(FeeRouter.SchemaNotFound.selector);
+        router.setSchemaUIDs(revocableUID, lpUID_);
+    }
+
+    // ═══════════════ RESIDUAL REDEPLOY (M-03) ═══════════════
+
+    function test_DeployResiduals_RevertsWhenNothingToDeploy() public {
+        vm.expectRevert(FeeRouter.NothingToDeploy.selector);
+        router.deployResiduals(1, 1, 1, block.timestamp + 60);
+    }
+
+    function test_DeployResiduals_RedeploysStrandedBalances() public {
+        // Strand residuals in the router: wNUT (wrapped here, delivered to router)
+        // + raw NUT minted directly to the router.
+        nut.mint(address(this), 30e18);
+        nut.approve(address(wnut), 30e18);
+        wnut.depositFor(address(router), 30e18);
+        nut.mint(address(router), 30e18);
+
+        uint256 liq = router.deployResiduals(29e18, 29e18, 800e24, block.timestamp + 1800);
+
+        // MockLpRouter consumes everything: liquidity = 30e18 * 30e18 / 1e12.
+        assertEq(liq, 900e24);
+        assertEq(router.totalLpAdded(), 900e24);
+        assertEq(pair.balanceOf(address(router)), 900e24);
+        (, uint256 w, uint256 n) = router.residuals();
+        assertEq(w, 0);
+        assertEq(n, 0);
+    }
+
+    function test_DeployResiduals_OnlyOperator() public {
+        nut.mint(address(this), 30e18);
+        nut.approve(address(wnut), 30e18);
+        wnut.depositFor(address(router), 30e18);
+        nut.mint(address(router), 30e18);
+        vm.prank(attacker);
+        vm.expectRevert();
+        router.deployResiduals(1, 1, 1, block.timestamp + 60);
+    }
+
+    function test_DeployResiduals_BlocksWhenPaused() public {
+        nut.mint(address(this), 30e18);
+        nut.approve(address(wnut), 30e18);
+        wnut.depositFor(address(router), 30e18);
+        nut.mint(address(router), 30e18);
+        router.pause();
+        vm.expectRevert();
+        router.deployResiduals(1, 1, 1, block.timestamp + 60);
+    }
+
+    function test_DeployResiduals_RespectsDeadlineBounds() public {
+        nut.mint(address(this), 30e18);
+        nut.approve(address(wnut), 30e18);
+        wnut.depositFor(address(router), 30e18);
+        nut.mint(address(router), 30e18);
+        vm.expectRevert(FeeRouter.DeadlineTooFar.selector);
+        router.deployResiduals(1, 1, 1, block.timestamp + HORIZON + 1);
     }
 
     // ═══════════════ CONSTRUCTOR GUARDS ═══════════════

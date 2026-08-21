@@ -90,6 +90,7 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         uint256 timestamp
     );
     event ResidualsCarried(uint256 usdc, uint256 wnut, uint256 nut);
+    event ResidualsDeployed(uint256 wnut, uint256 nut, uint256 liquidity, uint256 timestamp);
     event PipsBpsUpdated(uint256 oldBps, uint256 newBps);
     event SchemaUIDsUpdated(bytes32 pipsSchema, bytes32 lpSchema);
     event CapsUpdated(uint256 maxUsdcPerRun, uint256 maxDeadlineHorizon);
@@ -116,6 +117,7 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
     error NothingToRecover();
     error NothingToRescue();
     error BadCap();
+    error NothingToDeploy();
 
     constructor(
         address usdc_,
@@ -309,6 +311,51 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         return (usdc.balanceOf(address(this)), wnut.balanceOf(address(this)), nut.balanceOf(address(this)));
     }
 
+    /**
+     * @notice Redeploy accumulated NUT/wNUT residuals into the LP. Operator-only.
+     *         Gives stranded residuals a bounded redeployment path instead of
+     *         permanently trapped value. LP tokens stay protocol-owned; USDC
+     *         residuals remain admin-gated (rescueUsdc).
+     * @dev    Uses the FULL current residual balances — residuals are by
+     *         definition already router-owned accounting; there is no caller
+     *         contribution to sweep. Any post-LP remainder simply carries again.
+     */
+    function deployResiduals(
+        uint256 minLpWnut,
+        uint256 minLpNut,
+        uint256 minLiquidityOut,
+        uint256 deadline
+    )
+        external
+        nonReentrant
+        whenNotPaused
+        onlyRole(OPERATOR_ROLE)
+        returns (uint256 liquidity)
+    {
+        uint256 wnutBal = wnut.balanceOf(address(this));
+        uint256 nutBal = nut.balanceOf(address(this));
+        if (wnutBal == 0 || nutBal == 0) revert NothingToDeploy();
+        if (minLpWnut == 0 || minLpNut == 0 || minLiquidityOut == 0) revert ZeroSlippageBound();
+        if (block.timestamp > deadline) revert DeadlineExpired();
+        if (deadline - block.timestamp > maxDeadlineHorizon) revert DeadlineTooFar();
+
+        uint256 lpBefore = lpToken.balanceOf(address(this));
+        IERC20(address(wnut)).forceApprove(address(lpRouter), wnutBal);
+        nut.forceApprove(address(lpRouter), nutBal);
+        lpRouter.addLiquidity(
+            address(wnut), address(nut), wnutBal, nutBal,
+            minLpWnut, minLpNut, address(this), deadline
+        );
+        IERC20(address(wnut)).forceApprove(address(lpRouter), 0);
+        nut.forceApprove(address(lpRouter), 0);
+
+        liquidity = lpToken.balanceOf(address(this)) - lpBefore;
+        if (liquidity < minLiquidityOut) revert InsufficientLiquidity();
+
+        totalLpAdded += liquidity;
+        emit ResidualsDeployed(wnutBal, nutBal, liquidity, block.timestamp);
+    }
+
     // ═══════════════ INTERNAL ═══════════════
 
     function _schemaMatches(
@@ -318,7 +365,13 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
     ) internal view returns (bool) {
         if (uid == bytes32(0)) return false;
         SchemaRecord memory record = registry.getSchema(uid);
-        return record.uid == uid && keccak256(bytes(record.schema)) == keccak256(bytes(expectedDef));
+        // Full semantics binding: exact definition, no resolver hook, immutable.
+        // A resolver-bearing or revocable schema can change attestation
+        // execution/liveness and must not satisfy a protocol accounting invariant.
+        return record.uid == uid
+            && keccak256(bytes(record.schema)) == keccak256(bytes(expectedDef))
+            && address(record.resolver) == address(0)
+            && !record.revocable;
     }
 
     function _attestPips(
@@ -387,6 +440,19 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
 
     function pause() external onlyRole(DEFAULT_ADMIN_ROLE) { _pause(); }
     function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) { _unpause(); }
+
+    /// @dev Operator lifecycle: when the default admin changes, the outgoing
+    ///      admin loses OPERATOR_ROLE. Admin and operator are separate
+    ///      lifecycle-controlled identities; authority handoff removes ALL
+    ///      authority. New admins grant operators explicitly.
+    function _acceptDefaultAdminTransfer() internal virtual override {
+        address oldAdmin = defaultAdmin();
+        super._acceptDefaultAdminTransfer();
+        address newAdmin = defaultAdmin();
+        if (oldAdmin != newAdmin && hasRole(OPERATOR_ROLE, oldAdmin)) {
+            _revokeRole(OPERATOR_ROLE, oldAdmin);
+        }
+    }
 
     /// @notice Sweep accumulated PIPS to treasury custody. PIPS token only.
     function recoverPips(address to) external onlyRole(DEFAULT_ADMIN_ROLE) returns (uint256) {

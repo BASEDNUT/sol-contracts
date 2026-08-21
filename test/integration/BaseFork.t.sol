@@ -24,7 +24,6 @@ import {
  */
 contract BaseForkTest is Test {
     string constant RPC_ENV = "BASE_RPC_URL";
-    string constant RPC_FALLBACK = "https://base.publicnode.com";
 
     // Predeployed system contracts on Base
     address constant EAS = 0x4200000000000000000000000000000000000021;
@@ -41,7 +40,14 @@ contract BaseForkTest is Test {
     FeeRouter router;
 
     function setUp() public {
-        string memory rpc = vm.envOr(RPC_ENV, RPC_FALLBACK);
+        // OFFLINE BY DEFAULT: this test only runs when BASE_RPC_URL is explicitly
+        // provided (fork tests read live mainnet state — operator approval required).
+        // No RPC fallback. No network access without explicit opt-in.
+        string memory rpc = vm.envOr(RPC_ENV, string(""));
+        if (bytes(rpc).length == 0) {
+            vm.skip(true);
+            return;
+        }
         vm.createSelectFork(rpc);
 
         usdc = new MockUSDC();

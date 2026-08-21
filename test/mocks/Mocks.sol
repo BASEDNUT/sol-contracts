@@ -74,6 +74,12 @@ contract MockEAS {
     }
 }
 
+// ── Resolver stub: address-only, never called. L-01 schema-semantics tests. ──
+contract MockResolver {
+    // Intentionally empty: the router only checks the schema RECORD's resolver
+    // field is zero/nonzero; it never calls the resolver.
+}
+
 // ── PIPS adapters ──
 contract MockPipsBuyer {
     MockUSDC public usdc;
