@@ -1,0 +1,18 @@
+{
+  "chainId": 8453,
+  "name": "Wrapped NUT",
+  "symbol": "wNUT",
+  "address": "0xBA5ED46e31F80dafF307cbf60bd422a6f62E3dd3",
+  "underlying": "0xb8DE15Fb529d98C93C749De63c749D48D25A30DF",
+  "transactionHash": "0x8fda16be305849eecd7cd4fa91b765e6d31672ae17d25b5ae1022809f9dc5403",
+  "create2Factory": "0x4e59b44847b379578588920cA78FbF26c0B4956C",
+  "salt": "0x135b208ac2480b0d876944416de16e7a3b9a1f65bf4ce3648080ff0306f03ee4",
+  "initCodeHash": "0x0333a81c53a016584226e27ef7979f8827093744b1c19cb8866206485151ef54",
+  "solc": "0.8.36",
+  "openzeppelin": "5.7.0",
+  "optimizer": false,
+  "viaIR": false,
+  "evmVersion": "cancun",
+  "deployer": "0x135b208ac2480b0d876944416de16e7a3b9a1f65",
+  "legacyReplaced": "0x0d5cf613c507a648c3456044306afb4780348da2"
+}

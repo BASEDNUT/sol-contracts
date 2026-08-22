@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {FeeRouter} from "../../src/router/FeeRouter.sol";
-import {WNUT} from "../../src/wnut/WNUT.sol";
+import {WNUT} from "../../src/WNUT.sol";
 import {ISchemaResolver} from "@eas/contracts/resolver/ISchemaResolver.sol";
 
 import {

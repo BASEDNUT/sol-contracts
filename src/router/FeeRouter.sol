@@ -13,7 +13,7 @@ import {IEAS} from "@eas/contracts/IEAS.sol";
 import {ISchemaRegistry, SchemaRecord} from "@eas/contracts/ISchemaRegistry.sol";
 import {AttestationRequest, AttestationRequestData, MultiAttestationRequest} from "@eas/contracts/IEAS.sol";
 
-import {WNUT} from "../wnut/WNUT.sol";
+import {WNUT} from "../WNUT.sol";
 import {IPipsBuyer} from "../interfaces/IPipsBuyer.sol";
 import {ISwapRouter, IAddLiquidityRouter} from "../interfaces/ISwapRouter.sol";
 

@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
-import {WNUT} from "../../src/wnut/WNUT.sol";
+import {WNUT} from "../../src/WNUT.sol";
 import {MockERC20} from "../mocks/Mocks.sol";
 
 /// @dev WETH9-model invariants: permissionless wrap/unwrap, 1:1 backing,
