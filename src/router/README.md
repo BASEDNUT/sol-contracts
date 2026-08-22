@@ -16,7 +16,7 @@ Deploys incoming USDC revenue across two legs, emitting an EAS attestation per l
 - Single authority: `DEFAULT_ADMIN_ROLE` via `AccessControlDefaultAdminRules` (2-step + delayed admin transfer). This is an ownership-transfer delay, **not** an execution timelock — admin parameter changes take effect immediately.
 - `OPERATOR_ROLE` RBAC on `splitAndDeploy`, bounded by caps
 - Chain-ID guard at construction — wrong-chain deploy reverts
-- Constructor validates all dependencies (nonzero + code + wNUT.underlyingNUT() == NUT + registry binding + **LP token pair tokens == {wNUT, NUT}** + schema definitions)
+- Constructor validates all dependencies (nonzero + code + wNUT.underlying() == NUT + registry binding + **LP token pair tokens == {wNUT, NUT}** + schema definitions)
 - Allowance hygiene: `forceApprove` exact amounts, reset to 0 after every external call
 - LP position is protocol-owned; LP token is pair-validated at construction and on the protected-token denylist — cannot be swept
 - Unconsumed LP-side residuals are explicitly surfaced via `ResidualsCarried` event + `residuals()` view (not silently stranded)

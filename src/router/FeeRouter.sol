@@ -178,7 +178,7 @@ contract FeeRouter is AccessControlDefaultAdminRules, ReentrancyGuard, Pausable 
         ) revert BadDependency();
 
         if (block.chainid != expectedChainId_) revert ChainMismatch();
-        if (WNUT(wnut_).underlyingNUT() != nut_) revert BadDependency();
+        if (address(WNUT(wnut_).underlying()) != nut_) revert BadDependency();
         if (IEAS(eas_).getSchemaRegistry() != ISchemaRegistry(schemaRegistry_)) revert RegistryMismatch();
 
         // LP token must be the canonical wNUT/NUT pair

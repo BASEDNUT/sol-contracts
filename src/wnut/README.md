@@ -1,27 +1,14 @@
 # WNUT — Wrapped NUT
 
-1:1 ERC-20 wrapper over NUT (18 decimals, matching underlying).
+Standard WETH9-model wrapper over NUT. Bare OpenZeppelin `ERC20Wrapper` — **18 lines, zero custom logic**.
 
-## Design
+## Properties
+- **No admin surface**: no owner, no rescue, no upgrade path, no mint role. Nothing to hack, nothing to hand over.
+- **Mint discipline**: `depositFor()` pulls NUT before minting — unbacked mint impossible.
+- **Burn discipline**: `withdrawTo()` burns before release.
+- **Permissionless**: anyone wraps/unwraps for anyone.
+- **1:1 raw-unit backing**, decimals mirror underlying (NUT = verified immutable 18dp).
+- **WETH parity**: accidentally-sent tokens are permanently stranded. Accepted market-wide cost of zero attack surface.
 
-- OpenZeppelin `ERC20Wrapper` — deposit N NUT, receive N wNUT
-- Immutable deployment — no governance, no pausing, no upgradeability
-- `Ownable2Step` — two-step ownership transfer
-- Constructor validates NUT is a deployed contract (rejects EOAs)
-- Owner-only `recover()` for accidentally sent ERC-20s (never NUT or wNUT), uses SafeERC20
-- Owner-only `recoverSurplus()` mints wNUT covering direct NUT transfers / rebasing surplus (no stranded collateral)
-- Direct NUT transfers do not mint wNUT
-
-## Functions
-
-```solidity
-function depositFor(address account, uint256 amount) external returns (bool);
-function withdrawTo(address account, uint256 amount) external returns (bool);
-function recover(address token) external onlyOwner returns (uint256);
-function recoverSurplus() external onlyOwner returns (uint256);
-function underlyingNUT() external view returns (address);
-```
-
-## Tests
-
-15 tests — wrap/unwrap 1:1, direct-transfer no-mint, surplus recovery (amounts + RBAC + empty-revert), junk recovery (SafeERC20 + guards + RBAC), constructor validation, 2-step ownership. Run: `forge test --match-contract WNUTTest`
+## Audit posture
+No custom code to audit — inherits audited OZ library (thousands of deployments). WETH9 model has secured billions for 6+ years without admin functions.
