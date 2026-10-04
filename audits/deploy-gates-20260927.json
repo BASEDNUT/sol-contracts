@@ -1,0 +1,9 @@
+{
+  "operation": "HANDOFF-02 TokenFactory+WrapperFactory deploy, Base Sepolia 84532",
+  "gates": {
+    "analyze": {"safe": "preliminary", "next": "plan", "must_not_do": ["execute_without_plan"], "success": null, "note": "thin OZ v5.7.0 factory shells, ARD-06 spec"},
+    "plan": {"safe": "conditional", "next": "dry_run", "must_not_do": ["skip_gas_estimate"], "success": null, "note": "2 deploys, 2,355,411 gas, 0.000026 ETH"},
+    "dry_run": {"safe": true, "next": "execute", "must_not_do": ["proceed_on_simulation_error"], "success": null, "note": "SIMULATION COMPLETE vs live Sepolia RPC, sim addrs 0xB27D...4b13 + 0x678a...0dC7"},
+    "execute": {"safe": true, "next": "verify", "must_not_do": ["assume_success_without_receipt"], "success": null, "note": "Boss GO 2026-09-27 13:42 AST; sentinel re-check: budget 0.000026/0.0015 ETH=LOW, no kill switch, wallet funded"}
+  }
+}
