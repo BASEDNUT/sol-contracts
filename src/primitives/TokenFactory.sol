@@ -33,10 +33,7 @@ contract TokenFactory {
     /// @param symbol Token symbol (nonempty).
     /// @param supply Total supply minted once at construction (must be > 0).
     /// @return token Address of the deployed Token.
-    function create(string calldata name, string calldata symbol, uint256 supply)
-        external
-        returns (address token)
-    {
+    function create(string calldata name, string calldata symbol, uint256 supply) external returns (address token) {
         if (supply == 0) revert TokenFactory__ZeroSupply();
         if (bytes(name).length == 0) revert TokenFactory__EmptyName();
         if (bytes(symbol).length == 0) revert TokenFactory__EmptySymbol();

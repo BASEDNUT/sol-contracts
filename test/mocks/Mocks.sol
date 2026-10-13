@@ -111,11 +111,7 @@ contract MockEAS {
     }
 
     /// @dev Canonical EAS multiAttest: one UID per data entry, all-or-nothing.
-    function multiAttest(MultiAttestationRequest[] calldata requests)
-        external
-        payable
-        returns (bytes32[] memory uids)
-    {
+    function multiAttest(MultiAttestationRequest[] calldata requests) external payable returns (bytes32[] memory uids) {
         uids = new bytes32[](requests.length);
         for (uint256 i; i < requests.length; ++i) {
             SchemaRecord memory rec = registry.getSchema(requests[i].schema);
@@ -357,9 +353,7 @@ contract ReentrantPipsBuyer {
         usdc.transferFrom(msg.sender, address(this), usdcAmount);
         if (target != address(0)) {
             // Nested attempt — MUST hit ReentrancyGuard and bubble up.
-            try FeeRouter(target).splitAndDeploy(
-                usdcAmount, 1, 1, 1, 1, 1, block.timestamp + 600
-            ) {
+            try FeeRouter(target).splitAndDeploy(usdcAmount, 1, 1, 1, 1, 1, block.timestamp + 600) {
                 revert("REENTRANCY NOT BLOCKED");
             } catch {
                 revert("NESTED REVERT EXPECTED");
@@ -373,7 +367,11 @@ contract ReentrantPipsBuyer {
 /// @dev Malicious LP pair: reenters deployResiduals (via mint) or claimLpFees
 ///      (via claimFees) depending on mode.
 contract MaliciousPair is ERC20 {
-    enum Mode { OFF, REENTER_DEPLOY, REENTER_CLAIM }
+    enum Mode {
+        OFF,
+        REENTER_DEPLOY,
+        REENTER_CLAIM
+    }
     address public immutable token0;
     address public immutable token1;
     Mode public mode = Mode.OFF;
@@ -416,12 +414,20 @@ contract MaliciousPair is ERC20 {
 /// @dev LpRouter bound to MaliciousPair (type-correct ctor).
 contract EvilLpRouter {
     MaliciousPair public pair;
-    constructor(MaliciousPair pair_) { pair = pair_; }
+
+    constructor(MaliciousPair pair_) {
+        pair = pair_;
+    }
+
     function addLiquidity(
-        address tokenA, address tokenB,
-        uint256 amountADesired, uint256 amountBDesired,
-        uint256 amountAMin, uint256 amountBMin,
-        address to, uint256
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256
     ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity) {
         require(amountADesired >= amountAMin && amountBDesired >= amountBMin, "MIN_AMOUNTS");
         MockERC20(tokenA).transferFrom(msg.sender, address(this), amountADesired);

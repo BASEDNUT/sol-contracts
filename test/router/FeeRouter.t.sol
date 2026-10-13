@@ -816,7 +816,6 @@ contract FeeRouterTest is Test {
         router.setCaps(50e6, 60, 49e6);
     }
 
-
     // ═══════════════ AUDIT ROUND 4 ═══════════════
 
     /// @dev M-01: default-admin renunciation must be impossible — this
@@ -1004,9 +1003,23 @@ contract FeeRouterTest is Test {
     function test_CarryCountedAgainstPerRunCap() public {
         StingyPipsBuyer stingy = new StingyPipsBuyer(address(usdc), address(pips));
         FeeRouter fr = new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips), address(stingy),
-            address(swapRouter), address(lpRouter), address(eas), address(registry), address(pair),
-            pipsUID_, lpUID_, 0, block.chainid, 2 * AMOUNT, HORIZON, MAX_WINDOW
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(stingy),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            2 * AMOUNT,
+            HORIZON,
+            MAX_WINDOW
         );
         usdc.approve(address(fr), type(uint256).max);
         fr.splitAndDeploy(2 * AMOUNT, 300e18, 110e18, 58e18, 58e18, 16e26, block.timestamp + 1800);
@@ -1080,7 +1093,6 @@ contract FeeRouterTest is Test {
         assertEq(w + n, 2e18);
     }
 
-
     // ═══════════════ REENTRANCY HARNESS (round 6) ═══════════════
 
     /// @dev Malicious PIPS buyer reenters splitAndDeploy mid-leg. The whole
@@ -1088,9 +1100,23 @@ contract FeeRouterTest is Test {
     function test_Reentrancy_SplitAndDeploy_Blocked() public {
         ReentrantPipsBuyer evil = new ReentrantPipsBuyer(address(usdc), address(pips));
         FeeRouter fr = new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips), address(evil),
-            address(swapRouter), address(lpRouter), address(eas), address(registry), address(pair),
-            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON, MAX_WINDOW
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(evil),
+            address(swapRouter),
+            address(lpRouter),
+            address(eas),
+            address(registry),
+            address(pair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
         evil.setTarget(address(fr));
         usdc.approve(address(fr), type(uint256).max);
@@ -1106,9 +1132,23 @@ contract FeeRouterTest is Test {
         MaliciousPair evilPair = new MaliciousPair(address(wnut), address(nut));
         EvilLpRouter evilLp = new EvilLpRouter(evilPair);
         FeeRouter fr = new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips), address(pipsBuyer),
-            address(swapRouter), address(evilLp), address(eas), address(registry), address(evilPair),
-            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON, MAX_WINDOW
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(evilLp),
+            address(eas),
+            address(registry),
+            address(evilPair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
         evilPair.setMode(MaliciousPair.Mode.REENTER_DEPLOY);
         evilPair.setTarget(address(fr));
@@ -1128,9 +1168,23 @@ contract FeeRouterTest is Test {
         MaliciousPair evilPair = new MaliciousPair(address(wnut), address(nut));
         EvilLpRouter evilLp = new EvilLpRouter(evilPair);
         FeeRouter fr = new FeeRouter(
-            address(usdc), address(nut), address(wnut), address(pips), address(pipsBuyer),
-            address(swapRouter), address(evilLp), address(eas), address(registry), address(evilPair),
-            pipsUID_, lpUID_, 0, block.chainid, MAX_RUN, HORIZON, MAX_WINDOW
+            address(usdc),
+            address(nut),
+            address(wnut),
+            address(pips),
+            address(pipsBuyer),
+            address(swapRouter),
+            address(evilLp),
+            address(eas),
+            address(registry),
+            address(evilPair),
+            pipsUID_,
+            lpUID_,
+            0,
+            block.chainid,
+            MAX_RUN,
+            HORIZON,
+            MAX_WINDOW
         );
         evilPair.setMode(MaliciousPair.Mode.REENTER_CLAIM);
         evilPair.setTarget(address(fr));
@@ -1144,5 +1198,4 @@ contract FeeRouterTest is Test {
         (,, uint256 n2) = fr.residuals();
         assertEq(n2, 0, "no residual credit from failed claim");
     }
-
 }
